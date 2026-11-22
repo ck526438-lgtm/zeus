@@ -1,0 +1,68 @@
+# ================================================================
+#  ZEUS — configuration
+#  Commence TOUJOURS sur un compte DÉMO (mode: demo).
+# ================================================================
+
+mode: demo            # demo | live  (live exige aussi --confirm-live)
+
+mt5:
+  login: 0            # ou variable d'environnement ZEUS_MT5_LOGIN
+  password: ""        # ou ZEUS_MT5_PASSWORD (recommandé : ne pas écrire ici)
+  server: ""          # ou ZEUS_MT5_SERVER
+  path: ""            # chemin de terminal64.exe (optionnel)
+  magic: 777001       # identifiant des ordres de Zeus
+
+trading:
+  symbols: ["XAUUSD", "EURUSD"]
+  timeframe: M1               # M1 = haute fréquence (scalping)
+  loop_seconds: 1             # Zeus vérifie le marché chaque seconde
+  history_bars: 600           # bougies chargées pour l'analyse
+  max_positions_per_symbol: 1
+  max_open_positions: 3
+  deviation_points: 20        # glissement accepté
+  sessions_utc: [[7, 20]]     # heures de trading (UTC) — vide = 24h/24
+
+strategy:
+  ema_fast: 9
+  ema_slow: 21
+  ema_trend: 100
+  rsi_period: 14
+  atr_period: 14
+  adx_period: 14
+  adx_min: 18                 # pas de trade si le marché n'a pas de tendance
+  min_score: 0.60             # score minimum (0-1) pour entrer
+  use_model: true             # utilise le modèle IA s'il est entraîné
+  model_path: models/zeus_model.joblib
+  model_min_proba: 0.58       # confiance IA minimum pour valider l'entrée
+  exit_on_reverse: true       # coupe le trade si l'analyse s'inverse
+  exit_score: 0.55            # score inverse qui déclenche la coupure
+  max_hold_bars: 30           # coupe un trade qui stagne trop longtemps
+
+risk:
+  risk_per_trade_pct: 0.5     # % du capital risqué par trade
+  sl_atr_mult: 1.5            # stop loss = 1.5 x ATR
+  tp_atr_mult: 2.0            # take profit = 2 x ATR
+  breakeven_atr: 1.0          # SL au prix d'entrée après +1 ATR
+  trailing_atr: 1.2           # stop suiveur à 1.2 ATR
+  max_spread_points: 40       # pas d'entrée si le spread est trop large
+  max_daily_loss_pct: 3.0     # Zeus s'arrête pour la journée au-delà
+  max_daily_trades: 60
+  max_consecutive_losses: 5   # pause après 5 pertes d'affilée
+  pause_minutes_after_losses: 60
+  cooldown_seconds: 30        # délai entre deux entrées sur un symbole
+
+backtest:
+  initial_balance: 1000
+  spread_points: 25
+  commission_per_lot: 7.0
+  point: 0.01
+  contract_size: 100          # 100 pour XAUUSD, 100000 pour EURUSD
+
+telegram:
+  enabled: false
+  token: ""                   # ou ZEUS_TG_TOKEN
+  chat_id: ""                 # ou ZEUS_TG_CHAT
+
+logging:
+  journal: data/journal.csv
+  level: INFO
