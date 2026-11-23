@@ -160,7 +160,17 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _utf8_console() -> None:
+    """La console Windows est en cp1252 par défaut : on force l'UTF-8 (µ, ═, accents)."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")  # type: ignore[union-attr]
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
+    _utf8_console()
     args = build_parser().parse_args(argv)
     return int(args.fn(args))
 
