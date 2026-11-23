@@ -49,6 +49,7 @@ def load_mt5() -> Any:
 # Codes retour MT5 (valeurs documentées, utilisées si la constante manque)
 RET_PLACED, RET_DONE, RET_DONE_PARTIAL = 10008, 10009, 10010
 RET_TOO_MANY_REQUESTS = 10024
+RET_INVALID_FILL = 10030
 _OK_CODES = {RET_PLACED, RET_DONE, RET_DONE_PARTIAL}
 
 
@@ -66,6 +67,7 @@ class MT5Gateway:
         self._sink: EventSink | None = None
         self._book_enabled = False
         self._filling_market: int = 0
+        self._filling_pending: int = int(getattr(self.mt5, "ORDER_FILLING_RETURN", 2))
         self.info: Any = None
         self.order_rtt = LatencyTracker("aller-retour ordre MT5")
         self._throttled_until = 0.0
@@ -277,9 +279,9 @@ class MT5Gateway:
                     "type": m.ORDER_TYPE_BUY_LIMIT if order.side is Side.BUY else m.ORDER_TYPE_SELL_LIMIT,
                     "price": float(order.price or 0.0), "magic": self.magic, "comment": cid,
                     "type_time": m.ORDER_TIME_GTC,
-                    "type_filling": int(getattr(m, "ORDER_FILLING_RETURN", 2)),
+                    "type_filling": self._filling_pending,
                 }
-            res = self._send(req)
+            res = self._send_with_filling(req, order.order_type)
         except Exception as exc:
             self._emit(OrderEvent(EventKind.REJECTED, cid, reason=str(exc)), loop)
             return
@@ -287,10 +289,39 @@ class MT5Gateway:
             self._emit(OrderEvent(EventKind.REJECTED, cid, reason=f"{res.retcode} {res.comment}"), loop)
             return
         self._emit(OrderEvent(EventKind.ACK, cid, int(res.order)), loop)
-        if order.order_type is OrderType.MARKET and res.volume > 0:
-            fee = self._deal_fees(int(res.order))
-            self._emit(OrderEvent(EventKind.FILL, cid, int(res.order), fill_qty=float(res.volume),
-                                  fill_price=float(res.price), fee=fee), loop)
+        if order.order_type is OrderType.MARKET:
+            if res.volume > 0:
+                fee = self._deal_fees(int(res.order))
+                self._emit(OrderEvent(EventKind.FILL, cid, int(res.order), fill_qty=float(res.volume),
+                                      fill_price=float(res.price), fee=fee), loop)
+            if float(res.volume) < float(order.qty) - 1e-9:
+                # Ordre au marché exécuté partiellement (IOC) : le reliquat n'existe plus côté
+                # serveur. On le clôt localement, sinon l'ordre resterait « actif » pour toujours.
+                self._emit(OrderEvent(EventKind.CANCELED, cid, int(res.order),
+                                      reason="reliquat IOC non exécuté"), loop)
+
+    def _send_with_filling(self, req: dict[str, Any], otype: OrderType) -> Any:
+        """Envoie l'ordre ; si le broker refuse le mode de remplissage (10030), essaie les autres
+        modes et retient celui qui fonctionne pour les ordres suivants."""
+        res = self._send(req)
+        if res.retcode != RET_INVALID_FILL:
+            return res
+        m = self.mt5
+        modes = [int(getattr(m, n, v)) for n, v in (("ORDER_FILLING_RETURN", 2),
+                 ("ORDER_FILLING_IOC", 1), ("ORDER_FILLING_FOK", 0))]
+        for mode in modes:
+            if mode == req.get("type_filling"):
+                continue
+            res = self._send({**req, "type_filling": mode})
+            if res.retcode != RET_INVALID_FILL:
+                if res.retcode in _OK_CODES:
+                    if otype is OrderType.MARKET:
+                        self._filling_market = mode
+                    else:
+                        self._filling_pending = mode
+                    log.info("mode de remplissage %s retenu pour les ordres %s", mode, otype.value)
+                return res
+        return res
 
     def _deal_fees(self, order_ticket: int) -> float:
         deals = self._call("history_deals_get", ticket=order_ticket) or ()

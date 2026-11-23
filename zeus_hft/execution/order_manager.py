@@ -21,6 +21,7 @@ from typing import Callable
 
 from zeus_hft.core.orderbook import BookTop
 from zeus_hft.core.telemetry import LatencyTracker
+from zeus_hft.execution.journal import TradeJournal
 from zeus_hft.core.types import (
     Decision,
     EventKind,
@@ -66,8 +67,14 @@ class OrderManager:
         session_id: int | None = None,
         min_requote_ms: float = 100.0,
         clock_ns: Callable[[], int] = time.perf_counter_ns,
+        journal: TradeJournal | None = None,
     ) -> None:
         self.symbol = symbol
+        self.journal = journal
+        self.exit_reason = ""          # dernière raison de décision (renseignée par le moteur)
+        self._open_ns = 0
+        self._open_realized = 0.0
+        self._open_fees = 0.0
         self.gateway = gateway
         self.risk = risk
         self.point = point
@@ -127,6 +134,7 @@ class OrderManager:
         """Synchronisation initiale (positions déjà ouvertes dans MT5)."""
         self.position = position
         self.avg_price = avg_price if position else 0.0
+        self._open_ns, self._open_realized, self._open_fees = self._clock(), self.realized_pnl, self.fees
 
     # ------------------------------------------------------------------ #
     # Exécution d'une décision
@@ -275,9 +283,12 @@ class OrderManager:
             order.avg_fill_price = (order.avg_fill_price * order.filled_qty
                                     + ev.fill_price * qty) / tot
             order.filled_qty = tot
+            fees_before = self.fees
             self.fees += ev.fee
             self.fill_count += 1
+            pos_before, avg_before = self.position, self.avg_price
             self._apply_fill(order.side, qty, ev.fill_price)
+            self._track_trade(pos_before, avg_before, ev.fill_price, fees_before)
             if order.remaining <= _EPS:
                 order.status = OrderStatus.FILLED
             elif order.status not in _PENDING:
@@ -303,6 +314,25 @@ class OrderManager:
 
         if order.status.is_terminal:
             self.orders.pop(order.client_order_id, None)
+
+    def _track_trade(self, pos_before: float, avg_before: float, price: float,
+                     fees_before: float) -> None:
+        """Détecte l'ouverture / la fermeture d'un aller-retour et l'inscrit au journal."""
+        pos = self.position
+        now = self._clock()
+        if pos_before == 0.0 and pos != 0.0:
+            self._open_ns, self._open_realized, self._open_fees = now, self.realized_pnl, fees_before
+            return
+        closed = pos_before != 0.0 and (pos == 0.0 or (pos > 0) != (pos_before > 0))
+        if not closed:
+            return
+        gross = self.realized_pnl - self._open_realized
+        fees = self.fees - self._open_fees
+        if self.journal is not None:
+            self.journal.record("BUY" if pos_before > 0 else "SELL", abs(pos_before), avg_before,
+                                price, (now - self._open_ns) / 1e9, gross, fees, self.exit_reason)
+        if pos != 0.0:          # retournement : un nouvel aller-retour commence
+            self._open_ns, self._open_realized, self._open_fees = now, self.realized_pnl, self.fees
 
     def _apply_fill(self, side: Side, qty: float, price: float) -> None:
         signed = qty * int(side)

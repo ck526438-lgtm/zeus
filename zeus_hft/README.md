@@ -97,6 +97,39 @@ Options utiles : `--symbol`, `--lot`, `--max-dd`, `--max-inventory`, `--no-model
 Tous les réglages : [`config/settings.py`](config/settings.py), surchargeables par
 variables `ZEUS_HFT_*` (voir `.env.example`).
 
+## 🎓 Le laisser apprendre sur un compte démo MT5
+
+C'est l'usage recommandé : de **vrais ordres**, dans les vraies conditions du broker
+(spread, glissement, refus), **sans argent réel**.
+
+1. Dans MT5, connecte-toi à un **compte démo** et active le trading algorithmique.
+2. Ouvre `ZeusHFT-App.exe`, laisse **Mode = LIVE** et la case **« Autoriser compte réel » décochée**.
+3. Clique sur **Démarrer**. La barre du bas affiche « compte DÉMO MT5 · LIVE ». Si MT5 est connecté
+   à un compte réel, le bot refuse de démarrer.
+4. Laisse-le tourner pendant les sessions actives (Londres 07h–11h, New York 13h–17h UTC).
+
+**Ce qui est conservé d'une session à l'autre :**
+
+| Fichier | Contenu |
+|---|---|
+| `data/zeus_hft_model_XAUUSD.json` | la mémoire de l'IA (sauvegardée chaque minute et à l'arrêt) |
+| `data/zeus_hft_trades.csv` | chaque aller-retour : sens, prix, durée, PnL, frais, raison de sortie (s'ouvre dans Excel) |
+| `data/zeus_hft.log` | le journal technique |
+
+**Comment savoir s'il devient rentable ?** La barre du bas donne un verdict calculé sur les
+100 derniers trades **LIVE** (le DRY_RUN est compté à part) :
+
+- *en apprentissage (n/50 trades)* : pas assez de trades pour juger ;
+- *perdant* / *à l'équilibre* : continue en démo et ajuste les réglages ;
+- *RENTABLE (PF ≥ 1,2)* : profit factor d'au moins 1,2 et gain net sur les 100 derniers trades.
+  Ce n'est pas une garantie pour la suite, mais c'est le minimum avant d'envisager un compte réel
+  en lot minimum.
+
+L'IA apprend du **marché** à chaque tick, même quand le bot ne trade pas. Ses poids ne changent
+pas à cause des gains ou des pertes de ses propres trades. Le verdict, lui, mesure le résultat
+réel des ordres. Si le spread de ton broker est élevé (plus de 30 points sur l'or), aucune IA
+ne compensera ce coût : préfère un compte « raw spread » ou ECN.
+
 ## ⏱️ Performance et limites réelles de MT5
 
 | Mesure | Valeur typique |
@@ -130,6 +163,7 @@ zeus_hft/
 ├── strategies/online_model.py  # IA en ligne auto-évaluée
 ├── execution/order_manager.py  # cycle de vie, client_order_id déterministes, anti-doublons
 ├── execution/sim_exchange.py   # latence, slippage, frais maker/taker (paper + backtest)
+├── execution/journal.py        # journal CSV des trades + verdict de rentabilité
 ├── risk/risk_manager.py      # kill-switch
 ├── backtest/simulator.py     # tick par tick, même code que le live
 └── app/gui.py, factory.py    # interface Windows, assemblage

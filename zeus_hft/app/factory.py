@@ -10,6 +10,7 @@ from typing import Any, Awaitable, TypeVar
 from zeus_hft.config.settings import Mode, Settings
 from zeus_hft.core.engine import Engine
 from zeus_hft.core.orderbook import OrderBook
+from zeus_hft.execution.journal import TradeJournal
 from zeus_hft.execution.order_manager import OrderManager
 from zeus_hft.execution.sim_exchange import SimExchange
 from zeus_hft.feeds.synthetic import SyntheticFeed
@@ -57,14 +58,16 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         feed: Any = SyntheticFeed(s.symbol)
         gw: Any = None
         equity = s.starting_equity
+        account = "flux synthétique (sans MT5)"
     else:
         from zeus_hft.feeds.mt5_gateway import MT5Gateway
         gw = MT5Gateway(s)
         await asyncio.to_thread(gw.connect_blocking)
         s = s.model_copy(update=gw.symbol_specs())
         feed = gw
+        demo = await asyncio.to_thread(gw.is_demo)
+        account = "compte DÉMO MT5" if demo else "compte RÉEL MT5"
         if s.mode is Mode.LIVE:
-            demo = await asyncio.to_thread(gw.is_demo)
             if not demo and not s.confirm_live:
                 gw.shutdown()
                 raise LiveAccountRefused(
@@ -85,20 +88,35 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
                           taker_fee_bps=s.taker_fee_bps,
                           commission_per_lot=s.commission_per_lot / 2)
         execution = sim
+    # Le journal sépare DRY_RUN et LIVE : seuls de vrais ordres (démo ou réel) comptent
+    # pour juger la rentabilité en mode LIVE.
+    journal = TradeJournal(s.journal_file, s.mode.value, s.symbol,
+                           min_trades=s.verdict_min_trades)
     om = OrderManager(s.symbol, execution, risk, point=s.point, volume_step=s.volume_step,
                       volume_min=s.volume_min, contract_size=s.contract_size,
-                      session_id=int(time.time()))
+                      session_id=int(time.time()), journal=journal)
     if s.mode is Mode.LIVE:
         pos, avg = await asyncio.to_thread(gw.current_position)
         if pos:
             log.warning("position existante reprise : %+.2f lots @ %.5f", pos, avg)
             om.set_position(pos, avg)
 
+    strategy = OBIMomentumStrategy(s, use_model=use_model)
+    if use_model:
+        # Même mémoire d'IA en DRY_RUN et en LIVE : elle apprend du marché, pas de nos ordres.
+        strategy.attach_model_file(s.resolved_model_file())
+        if strategy.model_loaded and strategy.model is not None:
+            log.info("IA rechargée : %d exemples appris, précision %.1f %%",
+                     strategy.model.samples, strategy.model.accuracy * 100)
+        else:
+            log.info("IA : nouvel apprentissage (%s)", s.resolved_model_file())
     engine = Engine(
-        s, OrderBook(s.symbol, max_depth=50), OBIMomentumStrategy(s, use_model=use_model), om, risk,
+        s, OrderBook(s.symbol, max_depth=50), strategy, om, risk,
         feed=feed, sim=sim, realtime=True,
         heartbeat=gw.heartbeat if gw is not None else None,
         reconcile=gw.reconcile if (gw is not None and s.mode is Mode.LIVE) else None,
         starting_equity=equity,
     )
+    engine.account_label = f"{account} · {s.mode.value}"
+    log.info("prêt : %s, %s", engine.account_label, journal.stats().verdict)
     return engine, gw

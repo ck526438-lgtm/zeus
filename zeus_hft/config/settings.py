@@ -88,6 +88,11 @@ class Settings(BaseSettings):
     volume_step: float = 0.01
     volume_min: float = 0.01
 
+    # --- Apprentissage continu ---
+    model_file: str = "data/zeus_hft_model_{symbol}.json"   # mémoire de l'IA entre sessions
+    journal_file: str = "data/zeus_hft_trades.csv"          # journal des aller-retours
+    verdict_min_trades: int = Field(50, ge=10)
+
     log_level: str = "INFO"
     log_file: str = "data/zeus_hft.log"
     confirm_live: bool = False
@@ -101,6 +106,9 @@ class Settings(BaseSettings):
         if self.order_qty > self.max_net_inventory:
             raise ValueError("order_qty ne peut pas dépasser max_net_inventory")
         return self
+
+    def resolved_model_file(self) -> str:
+        return self.model_file.format(symbol=self.symbol, mode=self.mode.value)
 
     @property
     def is_live(self) -> bool:

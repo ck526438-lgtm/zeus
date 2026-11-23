@@ -73,7 +73,7 @@ class App(tk.Tk):
     def __init__(self) -> None:
         super().__init__()
         self.title(f"ZEUS HFT {__version__} — MetaTrader 5")
-        self.geometry("980x680")
+        self.geometry("1060x780")
         self.minsize(860, 600)
         self.configure(bg=BG)
         self.logq: "queue.Queue[str]" = queue.Queue(maxsize=5000)
@@ -109,10 +109,14 @@ class App(tk.Tk):
 
         cfg = ttk.Frame(self)
         cfg.pack(fill="x", padx=16, pady=4)
-        self.mode = tk.StringVar(value="DRY_RUN")
+        self.mode = tk.StringVar(value="LIVE")
         self.symbol = tk.StringVar(value="XAUUSD")
         self.lot = tk.StringVar(value="0.01")
         self.maxdd = tk.StringVar(value="300")
+        base = Settings()
+        self.maxspread = tk.StringVar(value=f"{base.max_spread_points:g}")
+        self.tp = tk.StringVar(value=f"{base.take_profit_points:g}")
+        self.sl = tk.StringVar(value=f"{base.stop_loss_points:g}")
         self.synthetic = tk.BooleanVar(value=False)
         self.use_model = tk.BooleanVar(value=True)
         self.confirm_live = tk.BooleanVar(value=False)
@@ -125,9 +129,16 @@ class App(tk.Tk):
         ):
             ttk.Label(cfg, text=label).pack(side="left", padx=(0, 4))
             w.pack(side="left", padx=(0, 12))
-        ttk.Checkbutton(cfg, text="IA adaptative", variable=self.use_model).pack(side="left", padx=4)
-        ttk.Checkbutton(cfg, text="Démo sans MT5", variable=self.synthetic).pack(side="left", padx=4)
-        ttk.Checkbutton(cfg, text="Autoriser compte réel", variable=self.confirm_live).pack(side="left", padx=4)
+
+        cfg2 = ttk.Frame(self)
+        cfg2.pack(fill="x", padx=16, pady=4)
+        for label, var in (("Spread max (pts)", self.maxspread), ("Take-profit (pts)", self.tp),
+                           ("Stop-loss (pts)", self.sl)):
+            ttk.Label(cfg2, text=label).pack(side="left", padx=(0, 4))
+            ttk.Entry(cfg2, textvariable=var, width=6).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(cfg2, text="IA adaptative", variable=self.use_model).pack(side="left", padx=4)
+        ttk.Checkbutton(cfg2, text="Simulation sans MT5", variable=self.synthetic).pack(side="left", padx=4)
+        ttk.Checkbutton(cfg2, text="Autoriser compte réel", variable=self.confirm_live).pack(side="left", padx=4)
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=16, pady=8)
@@ -145,7 +156,9 @@ class App(tk.Tk):
         cards = [("bid", "Bid"), ("ask", "Ask"), ("position", "Position (lots)"), ("pnl", "PnL net"),
                  ("equity", "Equity"), ("fills", "Exécutions"), ("lat", "Décision p50 / p99"),
                  ("ia", "IA : précision / poids"), ("score", "Score signal"), ("obi", "OBI / flux"),
-                 ("spread", "Spread (pts)"), ("risk", "Risque")]
+                 ("spread", "Spread (pts)"), ("risk", "Risque"),
+                 ("jtrades", "Trades journal / gagnants"), ("jnet", "PnL cumulé (journal)"),
+                 ("jpf", "Profit factor (100 derniers)"), ("samples", "IA : exemples appris")]
         for i, (key, title) in enumerate(cards):
             f = ttk.Frame(grid, style="Panel.TFrame", padding=10)
             f.grid(row=i // 4, column=i % 4, sticky="nsew", padx=4, pady=4)
@@ -155,6 +168,13 @@ class App(tk.Tk):
             self.vals[key] = v
         for c in range(4):
             grid.columnconfigure(c, weight=1)
+
+        bar = ttk.Frame(self, style="Panel.TFrame", padding=(12, 8))
+        bar.pack(fill="x", padx=20, pady=(2, 4))
+        self.account = ttk.Label(bar, text="Compte : —", style="Panel.TLabel")
+        self.account.pack(side="left")
+        self.verdict = ttk.Label(bar, text="", style="Panel.TLabel", font=("Segoe UI", 11, "bold"))
+        self.verdict.pack(side="right")
 
         self.log = tk.Text(self, height=12, bg="#0a0d12", fg="#b9c2d0", insertbackground=FG,
                            relief="flat", font=("Consolas", 9), wrap="none")
@@ -169,6 +189,9 @@ class App(tk.Tk):
             "mode": mode, "symbol": self.symbol.get().strip(), "order_qty": lot,
             "max_net_inventory": max(base.max_net_inventory, lot),
             "max_daily_drawdown": float(self.maxdd.get().replace(",", ".")),
+            "max_spread_points": float(self.maxspread.get().replace(",", ".")),
+            "take_profit_points": float(self.tp.get().replace(",", ".")),
+            "stop_loss_points": float(self.sl.get().replace(",", ".")),
             "confirm_live": self.confirm_live.get(),
         })
 
@@ -182,11 +205,14 @@ class App(tk.Tk):
             if self.synthetic.get():
                 messagebox.showerror("Mode LIVE", "Le mode LIVE exige MetaTrader 5 (décoche « Démo sans MT5 »).")
                 return
-            if not messagebox.askyesno(
-                    "Ordres réels",
-                    "Zeus HFT va envoyer des ORDRES RÉELS à MetaTrader 5.\n\n"
-                    "Aucune stratégie n'est garantie gagnante. As-tu validé le bot en DRY_RUN "
-                    "et sur un compte démo ?\n\nContinuer ?", icon="warning"):
+            msg = ("Zeus HFT va placer de vrais ordres dans MetaTrader 5.\n\n"
+                   "• Compte DÉMO : aucun argent réel en jeu, c'est l'endroit pour le laisser "
+                   "apprendre.\n• Compte RÉEL : refusé tant que « Autoriser compte réel » "
+                   "n'est pas coché.\n\nContinuer ?")
+            if self.confirm_live.get():
+                msg = ("⚠️ « Autoriser compte réel » est coché : si MT5 est connecté à un compte "
+                       "RÉEL, de l'argent réel sera engagé.\n\n" + msg)
+            if not messagebox.askyesno("Mode LIVE", msg, icon="warning"):
                 return
         self.thread = EngineThread(s, self.synthetic.get(), self.use_model.get())
         self.thread.start()
@@ -240,6 +266,19 @@ class App(tk.Tk):
             self.vals["score"].config(text=f"{sc:+.2f}", foreground=GREEN if sc > 0 else RED if sc < 0 else FG)
             self.vals["obi"].config(text=f"{st.get('obi', 0):+.2f} / {st.get('flow', 0):+.2f}")
             self.vals["spread"].config(text=fmt(st.get("spread_pts"), 1))
+            j = snap.get("journal")
+            if j is not None:
+                self.vals["jtrades"].config(text=f"{j.trades} / {j.win_rate:.0%}")
+                self.vals["jnet"].config(text=f"{j.net_pnl:+,.2f}",
+                                         foreground=GREEN if j.net_pnl >= 0 else RED)
+                pf = "—" if j.recent_trades == 0 else ("∞" if j.recent_pf == float("inf")
+                                                       else f"{j.recent_pf:.2f}")
+                self.vals["jpf"].config(text=pf)
+                ok = j.verdict.startswith("RENTABLE")
+                bad = j.verdict.startswith("perdant")
+                self.verdict.config(text=j.verdict, foreground=GREEN if ok else RED if bad else GOLD)
+            self.vals["samples"].config(text=f"{int(st.get('model_samples', 0)):,}")
+            self.account.config(text=f"Compte : {snap.get('account') or '—'}")
             killed = rk["killed"]
             self.vals["risk"].config(text="KILL" if killed else "OK", foreground=RED if killed else GREEN)
             self.status.config(text="● en marche" if snap["running"] else "● arrêt…",
