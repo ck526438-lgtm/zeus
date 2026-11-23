@@ -8,3 +8,6 @@ models/
 .env
 config.local.yaml
 .pytest_cache/
+build/
+dist/
+*.spec
