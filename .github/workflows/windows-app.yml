@@ -1,0 +1,64 @@
+name: windows-app
+
+on:
+  push:
+    branches: [main, hft-engine]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Dépendances
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt pyinstaller
+
+      - name: Tests (Windows)
+        run: pytest -q
+
+      - name: Backtest synthétique
+        run: python -m zeus_hft backtest --synthetic 20000
+
+      - name: Test de l'interface (ouverture / fermeture)
+        run: python -c "from zeus_hft.app.gui import App; a = App(); a.update(); a.destroy(); print('GUI OK')"
+
+      - name: Build ZeusHFT.exe (console) et ZeusHFT-App.exe (fenêtre)
+        run: |
+          pyinstaller --noconfirm --onefile --console  --name ZeusHFT     --collect-submodules zeus_hft --hidden-import MetaTrader5 zeus_hft_cli.py
+          pyinstaller --noconfirm --onefile --windowed --name ZeusHFT-App --collect-submodules zeus_hft --hidden-import MetaTrader5 zeus_hft_gui.py
+
+      - name: Test des exécutables
+        run: |
+          dist\ZeusHFT.exe --version
+          dist\ZeusHFT.exe backtest --synthetic 5000
+
+      - name: Paquet
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force release | Out-Null
+          Copy-Item dist\ZeusHFT.exe, dist\ZeusHFT-App.exe, .env.example, zeus_hft\README.md release\
+          Compress-Archive -Path release\* -DestinationPath ZeusHFT-windows.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ZeusHFT-windows
+          path: ZeusHFT-windows.zip
+
+      - name: Release (sur tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ZeusHFT-windows.zip

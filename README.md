@@ -14,6 +14,16 @@ tout symbole MT5.
 
 ---
 
+## ⚡ Nouveau : Zeus HFT (v2) — scalping haute fréquence
+
+Un second moteur, indépendant de Zeus v1, lit le **carnet d'ordres MT5 toutes les 2 ms**
+(OBI, micro-momentum, microprice, IA adaptative en ligne) avec un kill-switch strict, et
+existe en **application Windows** (`ZeusHFT-App.exe`).
+👉 Documentation : [`zeus_hft/README.md`](zeus_hft/README.md)
+
+
+---
+
 ## 🧠 Comment Zeus décide
 
 ```
