@@ -10,11 +10,12 @@ from typing import Any, Awaitable, TypeVar
 from zeus_hft.config.settings import Mode, Settings
 from zeus_hft.core.engine import Engine
 from zeus_hft.core.orderbook import OrderBook
+from zeus_hft.execution.journal import TradeJournal
 from zeus_hft.execution.order_manager import OrderManager
 from zeus_hft.execution.sim_exchange import SimExchange
 from zeus_hft.feeds.synthetic import SyntheticFeed
 from zeus_hft.risk.risk_manager import RiskLimits, RiskManager
-from zeus_hft.strategies.hft_strategy import OBIMomentumStrategy
+from zeus_hft.strategies.router import StrategyRouter
 
 log = logging.getLogger("zeus_hft")
 T = TypeVar("T")
@@ -44,8 +45,12 @@ def run_async(coro: Awaitable[T]) -> T:
 
 
 def _limits(s: Settings) -> RiskLimits:
-    return RiskLimits(s.max_daily_drawdown, s.max_net_inventory, s.max_orders_per_second,
-                      s.max_latency_ms, s.latency_breaches_to_kill, s.max_data_staleness_ms)
+    # Une seule position, taille fixe : l'inventaire max est plafonné au lot (pas de grille,
+    # pas de martingale, pas de renforcement contre la tendance).
+    return RiskLimits(s.max_daily_drawdown, min(s.max_net_inventory, s.order_qty),
+                      s.max_orders_per_second, s.max_latency_ms, s.latency_breaches_to_kill,
+                      s.max_data_staleness_ms, s.max_spread_points, s.max_daily_loss_pct,
+                      s.max_consecutive_rejects)
 
 
 async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = True) -> tuple[Engine, Any]:
@@ -57,14 +62,16 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         feed: Any = SyntheticFeed(s.symbol)
         gw: Any = None
         equity = s.starting_equity
+        account = "flux synthétique (sans MT5)"
     else:
         from zeus_hft.feeds.mt5_gateway import MT5Gateway
         gw = MT5Gateway(s)
         await asyncio.to_thread(gw.connect_blocking)
         s = s.model_copy(update=gw.symbol_specs())
         feed = gw
+        demo = await asyncio.to_thread(gw.is_demo)
+        account = "compte DÉMO MT5" if demo else "compte RÉEL MT5"
         if s.mode is Mode.LIVE:
-            demo = await asyncio.to_thread(gw.is_demo)
             if not demo and not s.confirm_live:
                 gw.shutdown()
                 raise LiveAccountRefused(
@@ -85,20 +92,49 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
                           taker_fee_bps=s.taker_fee_bps,
                           commission_per_lot=s.commission_per_lot / 2)
         execution = sim
+    # Le journal sépare DRY_RUN et LIVE : seuls de vrais ordres (démo ou réel) comptent
+    # pour juger la rentabilité en mode LIVE.
+    journal = TradeJournal(s.journal_file, s.mode.value, s.symbol,
+                           min_trades=s.verdict_min_trades)
     om = OrderManager(s.symbol, execution, risk, point=s.point, volume_step=s.volume_step,
                       volume_min=s.volume_min, contract_size=s.contract_size,
-                      session_id=int(time.time()))
+                      session_id=int(time.time()), journal=journal,
+                      stops_level_points=s.stops_level_points,
+                      freeze_level_points=s.freeze_level_points,
+                      server_sl_mult=s.server_sl_mult if s.mode is Mode.LIVE else 0.0)
     if s.mode is Mode.LIVE:
         pos, avg = await asyncio.to_thread(gw.current_position)
         if pos:
             log.warning("position existante reprise : %+.2f lots @ %.5f", pos, avg)
             om.set_position(pos, avg)
 
+    strategy = StrategyRouter(s, use_model=use_model, realtime=True)
+    if gw is not None:
+        try:
+            bars = await asyncio.to_thread(gw.recent_m1_bars, max(s.atr_baseline_bars, 50))
+            strategy.f.seed_bars(bars)
+            log.info("ATR M1 pré-chargé sur %d bougies : %.0f points", len(bars),
+                     strategy.f.atr_points)
+        except Exception:
+            log.warning("historique M1 indisponible : ATR reconstruit en direct (~%d min)",
+                        s.atr_period)
+    if use_model:
+        # Même mémoire d'IA en DRY_RUN et en LIVE : elle apprend du marché, pas de nos ordres.
+        strategy.attach_model_file(s.resolved_model_file())
+        if strategy.model_loaded and strategy.model is not None:
+            log.info("IA rechargée : %d exemples appris, précision %.1f %%",
+                     strategy.model.samples, strategy.model.accuracy * 100)
+        else:
+            log.info("IA : nouvel apprentissage (%s)", s.resolved_model_file())
     engine = Engine(
-        s, OrderBook(s.symbol, max_depth=50), OBIMomentumStrategy(s, use_model=use_model), om, risk,
+        s, OrderBook(s.symbol, max_depth=50), strategy, om, risk,
         feed=feed, sim=sim, realtime=True,
         heartbeat=gw.heartbeat if gw is not None else None,
         reconcile=gw.reconcile if (gw is not None and s.mode is Mode.LIVE) else None,
         starting_equity=equity,
+        position_snapshot=gw.position_snapshot if (gw is not None and s.mode is Mode.LIVE) else None,
     )
+    hedge = " · hedging" if getattr(gw, "hedging", False) else ""
+    engine.account_label = f"{account}{hedge} · {s.mode.value} · stratégie {s.strategy}"
+    log.info("prêt : %s, %s", engine.account_label, journal.stats().verdict)
     return engine, gw

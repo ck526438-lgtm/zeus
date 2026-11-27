@@ -129,16 +129,23 @@ async def test_risk_blocks_new_order(env) -> None:
     assert om.order_count == 0
 
 
-async def test_position_flip_avg_price(env) -> None:
+async def test_position_flip_closes_then_opens(env) -> None:
     om, sim, _, clk = env
     await om.execute(Decision(0.01, Urgency.AGGRESSIVE), top(100.0, 100.0), clk())
     await tick(sim, clk, 100.0, 100.0)
-    om.risk.limits.max_net_inventory = 1.0
-    await om.execute(Decision(-0.02, Urgency.AGGRESSIVE), top(101.0, 101.0), clk())
+    # retournement demandé : 1er temps = fermeture seule (compatible comptes hedging)
+    await om.execute(Decision(-0.01, Urgency.AGGRESSIVE), top(101.0, 101.0), clk())
+    (o,) = om.orders.values()
+    assert o.reduce_only and o.qty == pytest.approx(0.01)
     await tick(sim, clk, 101.0, 101.0)
-    assert om.position == pytest.approx(-0.02)
-    assert om.avg_price == pytest.approx(100.99)
+    assert om.position == 0.0
     assert om.realized_pnl == pytest.approx(0.01 * (100.99 - 100.01) * 100)
+    # 2e temps = ouverture du short
+    await om.execute(Decision(-0.01, Urgency.AGGRESSIVE), top(101.0, 101.0), clk())
+    (o2,) = om.orders.values()
+    assert not o2.reduce_only
+    await tick(sim, clk, 101.0, 101.0)
+    assert om.position == pytest.approx(-0.01) and om.avg_price == pytest.approx(100.99)
 
 
 async def test_flatten(env) -> None:

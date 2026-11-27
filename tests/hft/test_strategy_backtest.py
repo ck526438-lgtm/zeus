@@ -99,7 +99,8 @@ def test_strategy_stop_loss(s: Settings) -> None:
 
 
 async def test_backtest_synthetic_end_to_end(s: Settings) -> None:
-    rep = await run_backtest(s, synthetic_updates(15_000, seed=11))
+    s = s.model_copy(update={"strategy": "obi"})
+    rep = await run_backtest(s, synthetic_updates(15_000, seed=11, dt_ms=150))
     assert rep.ticks == 15_000
     assert rep.fills > 0 and rep.trades > 0
     assert rep.decision_latency is not None and rep.decision_latency.p50_us < 2_000
@@ -126,3 +127,13 @@ async def test_backtest_csv(tmp_path, s: Settings) -> None:
     assert len(ups) == 3000 and ups[0].bids is None
     rep = await run_backtest(s, iter(ups))
     assert rep.ticks == 3000
+
+
+LONDON_0700_UTC = 1_767_603_600_000   # 2026-01-05 09:00 heure serveur = 07:00 UTC
+
+
+async def test_backtest_auto_router_trades_momentum_in_session(s: Settings) -> None:
+    rep = await run_backtest(s, synthetic_updates(25_000, seed=5, start_ts_ms=LONDON_0700_UTC))
+    assert "momentum" in rep.by_strategy
+    assert rep.regimes.get("TENDANCE", 0) + rep.regimes.get("NORMAL", 0) > 10_000
+    assert not rep.killed

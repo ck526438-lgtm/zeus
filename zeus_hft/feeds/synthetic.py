@@ -24,20 +24,38 @@ def synthetic_updates(
     start_price: float = 2650.0,
     point: float = 0.01,
     levels: int = 5,
-    dt_ms: int = 150,
-    start_ts_ms: int = 1_767_225_600_000,   # 2026-01-01 UTC
+    dt_ms: int = 400,
+    start_ts_ms: int = 1_767_571_200_000,   # lundi 2026-01-05 00:00 heure serveur (dim. 22:00 UTC)
     seed: int = 7,
     predictiveness: float = 0.6,
+    regimes: bool = True,
 ) -> Iterator[MarketUpdate]:
+    """Marché synthétique avec régimes : CALME (retour à la moyenne), NORMAL, POUSSÉE
+    (tendance brève et rapide, comme une cassure sur l'or)."""
     rng = random.Random(seed)
     mid = start_price
+    anchor = start_price
     pressure = 0.0
     ts = start_ts_ms
+    regime, left, drift_dir = "normal", 3000, 0.0
     for _ in range(n):
+        if regimes:
+            left -= 1
+            if left <= 0:
+                regime = rng.choices(["calme", "normal", "poussee"], [0.4, 0.4, 0.2])[0]
+                left = (int(rng.uniform(30, 120)) if regime == "poussee"
+                        else int(rng.expovariate(1 / 1500)) + 200)
+                drift_dir = rng.choice([-1.0, 1.0])
+                anchor = mid
+        vol = {"calme": 1.5, "normal": 3.0, "poussee": 4.0}[regime] if regimes else 3.0
         pressure = 0.97 * pressure + rng.gauss(0.0, 0.25)
         p = math.tanh(pressure)
         drift = predictiveness * p * 2.0 * point
-        mid += drift + rng.gauss(0.0, 3.0 * point)
+        if regime == "poussee":
+            drift += drift_dir * 8.0 * point
+        elif regime == "calme":
+            drift += 0.02 * (anchor - mid)
+        mid += drift + rng.gauss(0.0, vol * point)
         half_spread = max(1, round(abs(rng.gauss(8, 3)))) * point
         bid = round((mid - half_spread) / point) * point
         ask = round((mid + half_spread) / point) * point

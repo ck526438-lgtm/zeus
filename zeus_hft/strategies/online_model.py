@@ -13,8 +13,11 @@ ticks, momentum, microprice, spread, volatilité).
 """
 from __future__ import annotations
 
+import json
 import math
+import os
 from collections import deque
+from pathlib import Path
 
 import numpy as np
 
@@ -99,3 +102,37 @@ class OnlineLogit:
 
     def reset_pending(self) -> None:
         self._pending.clear()
+
+    # ------------------------------------------------------------------ #
+    # Persistance : l'IA reprend son apprentissage d'une session à l'autre
+    # ------------------------------------------------------------------ #
+    def to_dict(self) -> dict[str, object]:
+        return {"version": 1, "n": self.n, "w": self.w.tolist(), "mean": self._mean.tolist(),
+                "var": self._var.tolist(), "samples": self.samples, "accuracy": self.accuracy}
+
+    def load_dict(self, d: dict[str, object]) -> bool:
+        if d.get("n") != self.n:
+            return False             # nombre de features différent : on repart de zéro
+        self.w = np.asarray(d["w"], dtype=np.float64)
+        self._mean = np.asarray(d["mean"], dtype=np.float64)
+        self._var = np.asarray(d["var"], dtype=np.float64)
+        self.samples = int(d["samples"])  # type: ignore[arg-type]
+        self.accuracy = float(d["accuracy"])  # type: ignore[arg-type]
+        return True
+
+    def save(self, path: str | Path) -> None:
+        """Écriture atomique (fichier temporaire puis renommage)."""
+        p = Path(path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        tmp.write_text(json.dumps(self.to_dict()), encoding="utf-8")
+        os.replace(tmp, p)
+
+    def load(self, path: str | Path) -> bool:
+        p = Path(path)
+        if not p.exists():
+            return False
+        try:
+            return self.load_dict(json.loads(p.read_text(encoding="utf-8")))
+        except (ValueError, KeyError, TypeError):
+            return False

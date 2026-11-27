@@ -42,8 +42,20 @@ class OBIMomentumStrategy(Strategy):
         self._max_hold_ns = int(s.max_holding_s * 1e9)
         self._cooldown_ns = int(s.decision_cooldown_ms * 1e6)
         self.model = OnlineLogit(6) if use_model else None
+        self.model_path: str | None = None
+        self.model_loaded = False
         self._x = np.zeros(6)
         self.reset()
+
+    def attach_model_file(self, path: str) -> None:
+        """Charge l'IA déjà entraînée (si le fichier existe) et la sauvegardera au même endroit."""
+        self.model_path = path
+        if self.model is not None:
+            self.model_loaded = self.model.load(path)
+
+    def save_model(self) -> None:
+        if self.model is not None and self.model_path:
+            self.model.save(self.model_path)
 
     def reset(self) -> None:
         self._flow = RingBuffer(self.s.tick_flow_window)
@@ -113,7 +125,8 @@ class OBIMomentumStrategy(Strategy):
         self.last = {"obi": obi, "flow": tick_flow, "mom_bps": mom_bps, "micro": micro,
                      "vol_bps": vol, "spread_pts": spread_pts, "score": score,
                      "model_conf": conf,
-                     "model_acc": self.model.accuracy if self.model else 0.0}
+                     "model_acc": self.model.accuracy if self.model else 0.0,
+                     "model_samples": float(self.model.samples) if self.model else 0.0}
 
         if self._n < s.warmup_ticks:
             return None

@@ -22,7 +22,7 @@ from zeus_hft.execution.order_manager import OrderManager
 from zeus_hft.execution.sim_exchange import SimExchange
 from zeus_hft.feeds.base import MarketUpdate
 from zeus_hft.risk.risk_manager import RiskLimits, RiskManager
-from zeus_hft.strategies.hft_strategy import OBIMomentumStrategy
+from zeus_hft.strategies.router import StrategyRouter
 
 
 class SimClock:
@@ -50,6 +50,8 @@ class BacktestReport:
     killed: bool = False
     kill_reason: str = ""
     model_accuracy: float = 0.0
+    by_strategy: str = ""
+    regimes: dict[str, int] = field(default_factory=dict)
     decision_latency: LatencyStats | None = None
     equity_curve: list[tuple[int, float]] = field(default_factory=list)
 
@@ -72,6 +74,9 @@ class BacktestReport:
             f"PnL net              : {self.net_pnl:+,.2f}  (frais {self.fees:,.2f})",
             f"Profit factor        : {self.profit_factor:.2f}",
             f"Drawdown max         : {self.max_drawdown:,.2f}",
+            f"Par stratégie        : {self.by_strategy or 'aucun trade'}",
+            f"Régimes (ticks)      : " + ", ".join(f"{k} {v:,}" for k, v in
+                                                  sorted(self.regimes.items(), key=lambda x: -x[1])),
             f"Précision IA (live)  : {self.model_accuracy:.1%}",
             f"Latence de décision  : {lat_s}",
             f"Kill-switch          : {'OUI — ' + self.kill_reason if self.killed else 'non'}",
@@ -86,13 +91,16 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
                       slippage_points=s.sim_slippage_points, maker_fee_bps=s.maker_fee_bps,
                       taker_fee_bps=s.taker_fee_bps, commission_per_lot=s.commission_per_lot / 2,
                       touch_fill=touch_fill, clock_ns=clock)
-    limits = RiskLimits(s.max_daily_drawdown, s.max_net_inventory, s.max_orders_per_second,
-                        s.max_latency_ms, s.latency_breaches_to_kill, s.max_data_staleness_ms)
+    from zeus_hft.app.factory import _limits
+    from zeus_hft.execution.journal import TradeJournal
+    limits = _limits(s)
+    journal = TradeJournal(None, "BACKTEST", s.symbol, min_trades=s.verdict_min_trades)
     risk = RiskManager(limits, s.starting_equity, clock_ns=clock, wall_clock_s=lambda: clock.now / 1e9)
     om = OrderManager(s.symbol, sim, risk, point=s.point, volume_step=s.volume_step,
                       volume_min=s.volume_min, contract_size=s.contract_size, session_id=0,
-                      clock_ns=clock)
-    strat = OBIMomentumStrategy(s, use_model=use_model)
+                      clock_ns=clock, journal=journal, stops_level_points=s.stops_level_points,
+                      freeze_level_points=s.freeze_level_points)
+    strat = StrategyRouter(s, use_model=use_model, realtime=False)
     eng = Engine(s, OrderBook(s.symbol, max_depth=50), strat, om, risk, sim=sim,
                  clock_ns=clock, realtime=False)
 
@@ -107,6 +115,8 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
         await eng.process(upd)
         last = upd
         rep.ticks += 1
+        lbl = strat.f.regime.label
+        rep.regimes[lbl] = rep.regimes.get(lbl, 0) + 1
         pnl = om.net_pnl(eng.last_mid)
         eq = s.starting_equity + pnl
         peak = max(peak, eq)
@@ -127,6 +137,7 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
 
     # Fin de test : on ferme tout au dernier prix connu.
     if last is not None and (om.position != 0.0 or om.orders):
+        om.exit_reason = "fin du backtest"
         for _ in range(3):
             await om.flatten(0)
             clock.now += sim.latency_ns + 1
@@ -147,6 +158,7 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
     rep.killed = risk.killed
     rep.kill_reason = risk.kill_reason
     rep.model_accuracy = strat.model.accuracy if strat.model else 0.0
+    rep.by_strategy = journal.strategy_summary()
     rep.decision_latency = eng.decision_latency.stats()
     if export_equity:
         Path(export_equity).parent.mkdir(parents=True, exist_ok=True)
