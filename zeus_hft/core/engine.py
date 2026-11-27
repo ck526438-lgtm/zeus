@@ -262,6 +262,14 @@ class Engine:
                     if self.risk.latency_blocked and ping <= self.s.max_latency_ms:
                         self._alert("ok", "lat-ok", f"latence revenue à {ping:.0f} ms")
                     self.risk.record_latency(ping)
+                    if self.s.is_live:
+                        reason = getattr(self.feed, "algo_reason", "")
+                        if reason and "algo" not in self.risk.halts:
+                            self.risk.halt("algo", reason)
+                            self._alert("crit", "algo", f"ordres bloqués : {reason}", force=True)
+                        elif not reason and "algo" in self.risk.halts:
+                            self.risk.resume("algo")
+                            self._alert("ok", "algo-ok", "trading algorithmique de nouveau autorisé")
                     if ping > self.s.max_latency_ms:
                         self._alert("warn", "lat", f"latence {ping:.0f} ms > {self.s.max_latency_ms:.0f} ms "
                                                    "(entrées bloquées)")

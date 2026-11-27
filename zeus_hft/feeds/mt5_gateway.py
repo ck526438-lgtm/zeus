@@ -15,6 +15,7 @@ avec le terminal) :
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import threading
 import time
@@ -71,6 +72,8 @@ class MT5Gateway:
         self.info: Any = None
         self.order_rtt = LatencyTracker("aller-retour ordre MT5")
         self._throttled_until = 0.0
+        self.algo_ok = True
+        self.algo_reason = ""
         self.hedging = False             # compte hedging : une vente n'annule pas un achat
         self.supports_passive_reduce = True
         self.latency_cb: Any = None      # appelé avec le RTT (ms) de chaque ordre
@@ -83,10 +86,15 @@ class MT5Gateway:
             return getattr(self.mt5, fn)(*a, **kw)
 
     def connect_blocking(self) -> Any:
+        from zeus_hft.feeds.mt5_launch import find_terminal, resolve_symbol, trading_permission
+
         s = self.s
         kw: dict[str, Any] = {}
-        if s.mt5_path:
-            kw["path"] = s.mt5_path
+        path = s.mt5_path or (find_terminal() if os.name == "nt" else "")
+        if path:
+            kw["path"] = path            # MT5 est lancé automatiquement s'il n'est pas ouvert
+            kw["timeout"] = 60_000
+            log.info("terminal MT5 : %s", path)
         if s.mt5_login:
             kw.update(login=int(s.mt5_login), password=s.mt5_password.get_secret_value(),
                       server=s.mt5_server)
@@ -100,7 +108,13 @@ class MT5Gateway:
         else:
             raise RuntimeError("connexion MT5 impossible après plusieurs essais")
         if not self._call("symbol_select", self.symbol, True):
-            raise RuntimeError(f"symbole indisponible : {self.symbol}")
+            names = [x.name for x in (self._call("symbols_get") or ())]
+            alt = resolve_symbol(self.symbol, names)
+            if alt is None or not self._call("symbol_select", alt, True):
+                raise RuntimeError(f"symbole {self.symbol} introuvable chez ce broker")
+            log.warning("symbole %s introuvable : utilisation de %s (nom chez ce broker)",
+                        self.symbol, alt)
+            self.symbol = alt
         self.info = self._call("symbol_info", self.symbol)
         self._filling_market = self._pick_filling(int(getattr(self.info, "filling_mode", 0)))
         if self.s.use_market_book:
@@ -109,6 +123,9 @@ class MT5Gateway:
                 log.warning("DOM indisponible chez ce broker : repli sur le flux de ticks")
         self.connected = True
         acc = self._call("account_info")
+        self.algo_ok, self.algo_reason = trading_permission(self._call("terminal_info"), acc)
+        if not self.algo_ok:
+            log.warning("trading impossible pour l'instant : %s", self.algo_reason)
         hedge_mode = getattr(self.mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
         self.hedging = getattr(acc, "margin_mode", -1) == hedge_mode
         # en hedging, un ordre limite de sortie ouvrirait une position inverse : sorties au marché
@@ -145,7 +162,8 @@ class MT5Gateway:
                 "tick_value": float(getattr(i, "trade_tick_value", 0.0) or 1.0),
                 "tick_size": float(getattr(i, "trade_tick_size", 0.0) or i.point),
                 "stops_level_points": float(getattr(i, "trade_stops_level", 0) or 0),
-                "freeze_level_points": float(getattr(i, "trade_freeze_level", 0) or 0)}
+                "freeze_level_points": float(getattr(i, "trade_freeze_level", 0) or 0),
+                "symbol": self.symbol}
 
     def recent_m1_bars(self, count: int = 200) -> list[tuple[float, float, float, float]]:
         """Dernières bougies M1 clôturées (o, h, l, c), de la plus ancienne à la plus récente."""
@@ -251,11 +269,14 @@ class MT5Gateway:
 
     def heartbeat_blocking(self) -> float | None:
         """Retourne le ping serveur en ms, ou None si le terminal est déconnecté."""
+        from zeus_hft.feeds.mt5_launch import trading_permission
+
         ti = self._call("terminal_info")
         if ti is None or not ti.connected:
             self.connected = False
             return None
         self.connected = True
+        self.algo_ok, self.algo_reason = trading_permission(ti, self._call("account_info"))
         return float(ti.ping_last) / 1000.0
 
     async def heartbeat(self) -> float | None:
