@@ -56,6 +56,10 @@ class FakeMT5:
                 NS(type=2, price=2649.9, volume=2, volume_dbl=2.0))
     def symbol_info_tick(self, s: str) -> Any: return self.tick
     def terminal_info(self) -> Any: return NS(connected=True, ping_last=42_000)
+    TIMEFRAME_M1 = 1
+    def copy_rates_from_pos(self, s: str, tf: int, start: int, count: int) -> Any:
+        return [{"open": 2650.0 + i * 0.1, "high": 2651.0 + i * 0.1, "low": 2649.0 + i * 0.1,
+                 "close": 2650.5 + i * 0.1} for i in range(count)]
     def positions_get(self, symbol: str) -> Any: return tuple(self.positions)
 
     def order_send(self, req: dict[str, Any]) -> Any:
@@ -187,3 +191,14 @@ async def test_feed_thread_pushes_updates(s: Settings) -> None:
     assert upd.tick.bid == 2650.1
     stop.set()
     await asyncio.wait_for(task, 3.0)
+
+
+def test_m1_history_seeds_atr(s: Settings) -> None:
+    from zeus_hft.strategies.features import MarketFeatures
+
+    gw = MT5Gateway(s, mt5=FakeMT5())
+    bars = gw.recent_m1_bars(120)
+    assert len(bars) == 120 and bars[0][1] == 2651.0
+    f = MarketFeatures(Settings(_env_file=None), 0.01)  # type: ignore[call-arg]
+    f.seed_bars(bars)
+    assert f.ready and f.atr_points == pytest.approx(200.0) and f.vol_ratio == pytest.approx(1.0)

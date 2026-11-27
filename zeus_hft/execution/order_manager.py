@@ -68,7 +68,16 @@ class OrderManager:
         min_requote_ms: float = 100.0,
         clock_ns: Callable[[], int] = time.perf_counter_ns,
         journal: TradeJournal | None = None,
+        stops_level_points: float = 0.0,
+        freeze_level_points: float = 0.0,
+        server_sl_mult: float = 0.0,
     ) -> None:
+        self.stops_level = stops_level_points * point
+        self.freeze_level = freeze_level_points * point
+        self.server_sl_mult = server_sl_mult
+        self.last_top: BookTop | None = None
+        self._entry_stop_points: float | None = None
+        self._entry_strategy = ""
         self.symbol = symbol
         self.journal = journal
         self.exit_reason = ""          # dernière raison de décision (renseignée par le moteur)
@@ -142,20 +151,34 @@ class OrderManager:
     async def execute(self, decision: Decision, top: BookTop, t0_ns: int,
                       data_age_ms: float = 0.0) -> int:
         """Rapproche (position + ordres) de la cible. Retourne le nb d'actions."""
+        self.last_top = top
         if self.has_inflight:
             return 0
         target = self.round_qty(decision.target_position)
+        # Retournement : on ferme d'abord, on ouvre au tick suivant (jamais d'ordre qui
+        # ferme ET ouvre — indispensable sur les comptes hedging MT5).
+        if self.position != 0.0 and target != 0.0 and (target > 0) != (self.position > 0):
+            target = 0.0
         desired = round(target - self.position, 8)     # ce qu'il reste à exécuter
+        reducing = self.position != 0.0 and abs(target) < abs(self.position)
+        if self.position == 0.0 and target != 0.0:      # ouverture : on retient qui et quel SL
+            self._entry_stop_points = decision.stop_points
+            self._entry_strategy = decision.strategy
+        urgency = decision.urgency
+        if reducing and not getattr(self.gateway, "supports_passive_reduce", True):
+            urgency = Urgency.AGGRESSIVE      # compte hedging : clôture par ticket, au marché
+        spread_pts = (top.ask - top.bid) / self.point
         actions = 0
 
-        if decision.urgency is Urgency.AGGRESSIVE:
+        if urgency is Urgency.AGGRESSIVE:
             # On va traverser le spread : on retire d'abord tout ordre limite.
             if self.orders:
                 return await self.cancel_all()
             qty = self.round_qty(desired)
             if qty != 0.0:
                 actions += await self._new(Side.BUY if qty > 0 else Side.SELL, abs(qty),
-                                           OrderType.MARKET, None, t0_ns, data_age_ms)
+                                           OrderType.MARKET, None, t0_ns, data_age_ms,
+                                           reducing, top, spread_pts)
             return actions
 
         # ---------- Passif : un seul ordre limite au bon prix ----------
@@ -166,6 +189,11 @@ class OrderManager:
         price = decision.limit_price
         if price is None:
             price = top.bid if side is Side.BUY else top.ask
+        # distance minimale du broker (SYMBOL_TRADE_STOPS_LEVEL) pour un ordre limite
+        if side is Side.BUY:
+            price = min(price, top.ask - max(self.stops_level, self.point))
+        else:
+            price = max(price, top.bid + max(self.stops_level, self.point))
         price = self.round_price(price)
 
         same: Order | None = None
@@ -178,7 +206,8 @@ class OrderManager:
             return actions
 
         if same is None:
-            return await self._new(side, abs(qty), OrderType.LIMIT, price, t0_ns, data_age_ms)
+            return await self._new(side, abs(qty), OrderType.LIMIT, price, t0_ns, data_age_ms,
+                                   reducing, top, spread_pts)
 
         if abs(same.remaining - abs(qty)) >= self.volume_step / 2:
             return await self._cancel(same)                # quantité à changer : cancel puis new
@@ -186,6 +215,23 @@ class OrderManager:
             if self._clock() - same.updated_ns >= self._min_requote_ns:
                 return await self._replace(same, price, t0_ns)
         return 0
+
+    def _frozen(self, order: Order) -> bool:
+        """SYMBOL_TRADE_FREEZE_LEVEL : ordre trop proche du marché pour être modifié/annulé."""
+        top = self.last_top
+        if self.freeze_level <= 0 or top is None or order.price is None:
+            return False
+        ref = top.ask if order.side is Side.BUY else top.bid
+        return abs(ref - order.price) <= self.freeze_level
+
+    def _server_sl(self, side: Side, top: BookTop | None) -> float | None:
+        """SL de secours côté serveur (protège si le bot s'arrête), au-delà du stops level."""
+        if self.server_sl_mult <= 0 or not self._entry_stop_points or top is None:
+            return None
+        dist = max(self._entry_stop_points * self.server_sl_mult * self.point,
+                   self.stops_level + 2 * self.point)
+        sl = top.bid - dist if side is Side.BUY else top.ask + dist
+        return self.round_price(sl)
 
     async def flatten(self, t0_ns: int | None = None) -> int:
         """Annule tout puis ferme la position au marché."""
@@ -195,7 +241,8 @@ class OrderManager:
         qty = self.round_qty(-self.position)
         if qty != 0.0:
             n += await self._new(Side.BUY if qty > 0 else Side.SELL, abs(qty), OrderType.MARKET,
-                                 None, t0_ns or time.perf_counter_ns(), 0.0)
+                                 None, t0_ns or time.perf_counter_ns(), 0.0, True,
+                                 self.last_top, 0.0)
         return n
 
     async def cancel_all(self) -> int:
@@ -209,9 +256,11 @@ class OrderManager:
     # Actions élémentaires
     # ------------------------------------------------------------------ #
     async def _new(self, side: Side, qty: float, otype: OrderType, price: float | None,
-                   t0_ns: int, data_age_ms: float) -> int:
+                   t0_ns: int, data_age_ms: float, reducing: bool = False,
+                   top: BookTop | None = None, spread_pts: float = 0.0) -> int:
         signed = qty * int(side)
-        verdict = self.risk.check_order(signed, self.position, self.working_signed, data_age_ms)
+        verdict = self.risk.check_order(signed, self.position, self.working_signed, data_age_ms,
+                                        spread_pts)
         if not verdict.allowed:
             log.debug("ordre refusé par le risque : %s %s", verdict.reason.value, verdict.detail)
             return 0
@@ -221,7 +270,8 @@ class OrderManager:
             return 0
         self._known_ids.add(cid)
         order = Order(cid, self.symbol, side, qty, otype, price, tick_recv_ns=t0_ns,
-                      created_ns=self._clock(), updated_ns=self._clock())
+                      created_ns=self._clock(), updated_ns=self._clock(), reduce_only=reducing,
+                      sl=None if reducing else self._server_sl(side, top))
         self.orders[cid] = order
         self.order_count += 1
         self.tick_to_order.record(time.perf_counter_ns() - t0_ns)
@@ -235,6 +285,8 @@ class OrderManager:
     async def _cancel(self, order: Order, force: bool = False) -> int:
         if order.status in _PENDING or order.status.is_terminal:
             return 0
+        if not force and self._frozen(order):
+            return 0
         if not self.risk.check_action().allowed and not force:
             return 0
         order.status = OrderStatus.PENDING_CANCEL
@@ -247,7 +299,7 @@ class OrderManager:
         return 1
 
     async def _replace(self, order: Order, price: float, t0_ns: int) -> int:
-        if not self.risk.check_action().allowed:
+        if self._frozen(order) or not self.risk.check_action().allowed:
             return 0
         prev = order.status
         order.status = OrderStatus.PENDING_REPLACE
@@ -273,6 +325,7 @@ class OrderManager:
         k = ev.kind
 
         if k is EventKind.ACK:
+            self.risk.record_execution_ok()
             if order.status is OrderStatus.PENDING_NEW:
                 order.status = OrderStatus.WORKING
         elif k is EventKind.FILL:
@@ -310,10 +363,31 @@ class OrderManager:
             else:
                 order.status = OrderStatus.REJECTED
                 order.reject_reason = ev.reason
+                self.risk.record_execution_error(ev.reason)
                 log.warning("ordre rejeté %s : %s", order.client_order_id, ev.reason)
 
         if order.status.is_terminal:
             self.orders.pop(order.client_order_id, None)
+
+    def sync_external(self, position: float, avg_price: float, mark: float | None,
+                      reason: str) -> None:
+        """La position MT5 a changé hors du bot (SL serveur touché, clôture manuelle...)."""
+        if abs(position - self.position) < 1e-9:
+            return
+        log.warning("position MT5 %+.2f ≠ bot %+.2f : resynchronisation (%s)",
+                    position, self.position, reason)
+        if self.position != 0.0 and mark is not None:
+            # on solde la partie fermée au dernier prix connu (estimation) pour garder un PnL cohérent
+            same_side = position != 0.0 and (position > 0) == (self.position > 0)
+            closed = abs(self.position) - abs(position) if same_side else abs(self.position)
+            if closed > 1e-9:
+                side = Side.SELL if self.position > 0 else Side.BUY
+                pos_before, avg_before = self.position, self.avg_price
+                self.exit_reason = reason
+                self._apply_fill(side, closed, mark)
+                self._track_trade(pos_before, avg_before, mark, self.fees)
+        if abs(position - self.position) > 1e-9:
+            self.set_position(position, avg_price)
 
     def _track_trade(self, pos_before: float, avg_before: float, price: float,
                      fees_before: float) -> None:
@@ -330,7 +404,8 @@ class OrderManager:
         fees = self.fees - self._open_fees
         if self.journal is not None:
             self.journal.record("BUY" if pos_before > 0 else "SELL", abs(pos_before), avg_before,
-                                price, (now - self._open_ns) / 1e9, gross, fees, self.exit_reason)
+                                price, (now - self._open_ns) / 1e9, gross, fees, self.exit_reason,
+                                self._entry_strategy)
         if pos != 0.0:          # retournement : un nouvel aller-retour commence
             self._open_ns, self._open_realized, self._open_fees = now, self.realized_pnl, self.fees
 

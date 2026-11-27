@@ -18,7 +18,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FIELDS = ["close_time_utc", "mode", "symbol", "side", "qty", "entry_price", "exit_price",
-          "duration_s", "gross_pnl", "fees", "net_pnl", "reason"]
+          "duration_s", "gross_pnl", "fees", "net_pnl", "reason", "strategy"]
 
 
 @dataclass(slots=True)
@@ -35,11 +35,13 @@ class TradeRecord:
     fees: float
     net_pnl: float
     reason: str = ""
+    strategy: str = ""
 
     def row(self) -> list[object]:
         return [self.close_time_utc, self.mode, self.symbol, self.side, round(self.qty, 4),
                 round(self.entry_price, 5), round(self.exit_price, 5), round(self.duration_s, 2),
-                round(self.gross_pnl, 4), round(self.fees, 4), round(self.net_pnl, 4), self.reason]
+                round(self.gross_pnl, 4), round(self.fees, 4), round(self.net_pnl, 4), self.reason,
+                self.strategy]
 
 
 @dataclass(slots=True)
@@ -77,6 +79,7 @@ class TradeJournal:
         self.gains = 0.0
         self.losses = 0.0
         self.recent: deque[float] = deque(maxlen=window)
+        self.by_strategy: dict[str, list[float]] = {}     # stratégie -> [trades, net, gains, pertes]
         self._q: queue.SimpleQueue[TradeRecord | None] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         if self.path is not None:
@@ -91,10 +94,19 @@ class TradeJournal:
             return
         try:
             with open(self.path, newline="", encoding="utf-8") as f:
-                for row in csv.DictReader(f):
-                    # on ne mélange pas démo réelle, paper trading et autres symboles
-                    if row.get("mode") == self.mode and row.get("symbol") == self.symbol:
-                        self._account(float(row["net_pnl"]))
+                reader = csv.DictReader(f)
+                header = reader.fieldnames or []
+                rows = list(reader)
+            if header != FIELDS:            # ancien format (v2.1) : migration sans perte
+                with open(self.path, "w", newline="", encoding="utf-8") as f:
+                    w = csv.DictWriter(f, FIELDS, extrasaction="ignore")
+                    w.writeheader()
+                    for r in rows:
+                        w.writerow({k: r.get(k, "") for k in FIELDS})
+            for row in rows:
+                # on ne mélange pas démo réelle, paper trading et autres symboles
+                if row.get("mode") == self.mode and row.get("symbol") == self.symbol:
+                    self._account(float(row["net_pnl"]), row.get("strategy") or "")
         except (OSError, ValueError, KeyError):
             pass
 
@@ -115,7 +127,14 @@ class TradeJournal:
             except OSError:
                 pass  # disque plein / fichier ouvert dans Excel : on ne bloque jamais le trading
 
-    def _account(self, net: float) -> None:
+    def _account(self, net: float, strategy: str = "") -> None:
+        st = self.by_strategy.setdefault(strategy or "autre", [0, 0.0, 0.0, 0.0])
+        st[0] += 1
+        st[1] += net
+        if net > 0:
+            st[2] += net
+        else:
+            st[3] -= net
         self.trades += 1
         self.net += net
         if net > 0:
@@ -127,11 +146,11 @@ class TradeJournal:
 
     # ------------------------------------------------------------------ #
     def record(self, side: str, qty: float, entry: float, exit_: float, duration_s: float,
-               gross: float, fees: float, reason: str = "") -> TradeRecord:
+               gross: float, fees: float, reason: str = "", strategy: str = "") -> TradeRecord:
         rec = TradeRecord(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), self.mode,
                           self.symbol, side, qty, entry, exit_, duration_s, gross, fees,
-                          gross - fees, reason)
-        self._account(rec.net_pnl)
+                          gross - fees, reason, strategy)
+        self._account(rec.net_pnl, strategy)
         if self._thread is not None:
             self._q.put(rec)
         return rec
@@ -151,6 +170,15 @@ class TradeJournal:
             verdict = f"perdant sur les {n} derniers trades (PF {rpf:.2f})"
         return JournalStats(self.trades, self.wins, self.net, _pf(self.gains, self.losses),
                             n, sum(self.recent), rpf, verdict)
+
+    def strategy_summary(self) -> str:
+        """Ex. : 'momentum 42 trades PF 1.31 | meanrev 18 trades PF 0.84'."""
+        parts = []
+        for name, (n, _net, g, l) in sorted(self.by_strategy.items()):
+            pf = _pf(g, l)
+            pf_s = "∞" if pf == float("inf") else f"{pf:.2f}"
+            parts.append(f"{name} {int(n)} trades PF {pf_s}")
+        return " | ".join(parts)
 
     def close(self) -> None:
         if self._thread is not None:

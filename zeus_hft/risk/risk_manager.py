@@ -31,6 +31,8 @@ class RiskReason(str, Enum):
     LATENCY = "LATENCY"
     STALE_DATA = "STALE_DATA"
     INVALID_QTY = "INVALID_QTY"
+    SPREAD = "SPREAD"
+    HALTED = "HALTED"
 
 
 @dataclass(slots=True, frozen=True)
@@ -51,6 +53,9 @@ class RiskLimits:
     max_latency_ms: float
     latency_breaches_to_kill: int = 3
     max_data_staleness_ms: float = 5_000.0
+    max_spread_points: float = 0.0          # 0 = pas de plafond
+    max_daily_loss_pct: float = 0.0         # % de l'equity du début de journée (0 = off)
+    max_consecutive_rejects: int = 5
 
 
 def _utc_day(ts_s: float) -> int:
@@ -72,6 +77,9 @@ class RiskManager:
         self._on_kill = on_kill
         self.killed = False
         self.kill_reason = ""
+        self._kill_daily = False           # True : levé automatiquement le jour suivant (UTC)
+        self.halts: dict[str, str] = {}    # pauses temporaires (flux figé, horloge...)
+        self._rejects = 0
         self.equity = starting_equity
         self.day_start_equity = starting_equity
         self.day_peak_equity = starting_equity
@@ -85,12 +93,35 @@ class RiskManager:
     # ------------------------------------------------------------------ #
     # Entrées
     # ------------------------------------------------------------------ #
-    def kill(self, reason: str) -> None:
+    def kill(self, reason: str, daily: bool = False) -> None:
+        """Arrêt d'urgence. ``daily=True`` : levé automatiquement à la journée UTC suivante."""
         if not self.killed:
             self.killed = True
             self.kill_reason = reason
+            self._kill_daily = daily
             if self._on_kill is not None:
                 self._on_kill(reason)
+
+    def halt(self, key: str, reason: str) -> None:
+        self.halts[key] = reason
+
+    def resume(self, key: str) -> None:
+        self.halts.pop(key, None)
+
+    def record_execution_error(self, reason: str) -> None:
+        self._rejects += 1
+        if self._rejects >= self.limits.max_consecutive_rejects:
+            self.kill(f"{self._rejects} erreurs d'exécution de suite (dernière : {reason})")
+
+    def record_execution_ok(self) -> None:
+        self._rejects = 0
+
+    @property
+    def daily_loss_limit(self) -> float:
+        lim = self.limits.max_daily_drawdown
+        if self.limits.max_daily_loss_pct > 0:
+            lim = min(lim, self.day_start_equity * self.limits.max_daily_loss_pct / 100.0)
+        return lim
 
     def update_equity(self, equity: float) -> None:
         """À appeler à chaque fill / tick (equity = solde + PnL latent)."""
@@ -99,12 +130,14 @@ class RiskManager:
             self._day = day
             self.day_start_equity = equity
             self.day_peak_equity = equity
+            if self.killed and self._kill_daily:       # nouvelle journée : reprise automatique
+                self.killed, self.kill_reason, self._kill_daily = False, "", False
         self.equity = equity
         if equity > self.day_peak_equity:
             self.day_peak_equity = equity
-        if self.daily_drawdown >= self.limits.max_daily_drawdown:
-            self.kill(f"drawdown journalier {self.daily_drawdown:.2f} >= "
-                      f"{self.limits.max_daily_drawdown:.2f}")
+        if self.daily_drawdown >= self.daily_loss_limit:
+            self.kill(f"perte du jour {self.daily_drawdown:.2f} >= {self.daily_loss_limit:.2f} "
+                      f"(reprise automatique demain 00:00 UTC)", daily=True)
 
     def record_latency(self, latency_ms: float) -> None:
         self.last_latency_ms = latency_ms
@@ -146,6 +179,7 @@ class RiskManager:
         position: float,
         working_signed: float,
         data_age_ms: float = 0.0,
+        spread_points: float = 0.0,
     ) -> RiskDecision:
         """Valide un nouvel ordre (ou une modification qui change la quantité).
 
@@ -163,10 +197,15 @@ class RiskManager:
         if data_age_ms > self.limits.max_data_staleness_ms:
             return self._reject(RiskReason.STALE_DATA, f"{data_age_ms:.0f} ms")
         if not reduces:
+            if self.halts:
+                return self._reject(RiskReason.HALTED, "; ".join(self.halts.values()))
+            if 0 < self.limits.max_spread_points < spread_points:
+                return self._reject(RiskReason.SPREAD,
+                                    f"{spread_points:.0f} > {self.limits.max_spread_points:.0f} pts")
             if self.latency_blocked:
                 return self._reject(RiskReason.LATENCY, f"{self.last_latency_ms:.1f} ms")
-            if self.daily_drawdown >= self.limits.max_daily_drawdown:
-                self.kill("drawdown journalier")
+            if self.daily_drawdown >= self.daily_loss_limit:
+                self.kill("perte du jour", daily=True)
                 return self._reject(RiskReason.DAILY_DRAWDOWN)
             if abs(projected) > self.limits.max_net_inventory + 1e-12:
                 return self._reject(RiskReason.INVENTORY,
@@ -193,5 +232,7 @@ class RiskManager:
             "daily_pnl": round(self.daily_pnl, 2),
             "daily_drawdown": round(self.daily_drawdown, 2),
             "latency_ms": round(self.last_latency_ms, 2),
+            "daily_limit": round(self.daily_loss_limit, 2),
+            "halts": list(self.halts.values()),
             "rejections": {k.value: v for k, v in self.rejections.items() if v},
         }

@@ -29,7 +29,8 @@ def _settings(a: argparse.Namespace, mode: Mode | None = None) -> Settings:
     over: dict[str, Any] = {}
     if mode is not None:
         over["mode"] = mode
-    for k in ("symbol", "order_qty", "max_daily_drawdown", "max_net_inventory"):
+    for k in ("symbol", "order_qty", "max_daily_drawdown", "max_net_inventory", "strategy",
+              "news_times_utc", "max_spread_points"):
         v = getattr(a, k, None)
         if v is not None:
             over[k] = v
@@ -87,6 +88,8 @@ def cmd_backtest(a: argparse.Namespace) -> int:
     if a.contract_size:
         s = s.model_copy(update={"contract_size": a.contract_size})
     setup_logging("WARNING", None)
+    if a.utc_offset is not None:
+        s = s.model_copy(update={"server_utc_offset_hours": a.utc_offset})
     if a.csv:
         updates = load_ticks_csv(a.csv, s.symbol)
     else:
@@ -128,6 +131,11 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--max-dd", dest="max_daily_drawdown", type=float)
         sp.add_argument("--max-inventory", dest="max_net_inventory", type=float)
         sp.add_argument("--no-model", action="store_true", help="désactive l'IA en ligne")
+        sp.add_argument("--strategy", choices=["auto", "momentum", "meanrev", "obi"],
+                        help="auto (défaut) = choix selon le régime de marché")
+        sp.add_argument("--news", dest="news_times_utc",
+                        help="heures de news UTC : '13:30' (chaque jour) ou '2026-12-04 13:30'")
+        sp.add_argument("--max-spread", dest="max_spread_points", type=float)
 
     r = sub.add_parser("run", help="temps réel (DRY_RUN ou LIVE)")
     common(r)
@@ -146,6 +154,8 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--touch-fill", type=float, default=0.0,
                    help="fraction exécutée quand le prix touche l'ordre (0 = prudent)")
     b.add_argument("--export", help="CSV de la courbe d'equity")
+    b.add_argument("--utc-offset", type=float,
+                   help="décalage heure serveur MT5 - UTC en heures (souvent 2 ou 3)")
     b.add_argument("--json", action="store_true")
     b.set_defaults(fn=cmd_backtest)
 

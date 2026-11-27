@@ -114,7 +114,8 @@ async def test_order_manager_writes_round_trips() -> None:
     await step(0.01, 100.0, 100.0, "achat")
     await step(0.0, 101.0, 101.0, "take-profit")           # +1 $ par 0,01 lot × 100
     await step(-0.01, 101.0, 101.0, "vente")
-    await step(0.01, 102.0, 102.0, "retournement")          # perte sur le short, puis long
+    await step(0.01, 102.0, 102.0, "retournement")          # ferme le short (perte)
+    await step(0.01, 102.0, 102.0, "achat")                 # puis ouvre le long
     await step(0.0, 102.5, 102.5, "stop-loss")
     st = j.stats()
     assert st.trades == 3

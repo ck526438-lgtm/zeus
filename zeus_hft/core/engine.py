@@ -54,7 +54,10 @@ class Engine:
         heartbeat: Callable[[], Any] | None = None,
         reconcile: Callable[[list[Any]], Any] | None = None,
         starting_equity: float | None = None,
+        position_snapshot: Callable[[], Any] | None = None,
     ) -> None:
+        self._position_snapshot = position_snapshot
+        self._last_tick_perf = 0
         self.s = s
         self.book = book
         self.strategy = strategy
@@ -91,6 +94,7 @@ class Engine:
         tick = upd.tick
         self.stats.ticks += 1
         self._last_tick = tick
+        self._last_tick_perf = time.perf_counter_ns()
 
         if self.sim is not None:                  # exécutions simulées avant la décision
             self.sim.on_market(tick.bid, tick.ask)
@@ -133,6 +137,7 @@ class Engine:
             log.critical("KILL-SWITCH : %s", self.risk.kill_reason)
             self._kill_handled = True
         if self.s.flatten_on_kill and (self.om.position != 0.0 or self.om.orders):
+            self.om.exit_reason = f"kill-switch : {self.risk.kill_reason}"
             await self.om.flatten(t0)
 
     # ------------------------------------------------------------------ #
@@ -160,6 +165,8 @@ class Engine:
             asyncio.create_task(self._reconcile_loop(), name="reconcile"),
             asyncio.create_task(self._telemetry_loop(), name="telemetry"),
             asyncio.create_task(self._model_save_loop(), name="model-save"),
+            asyncio.create_task(self._watchdog_loop(), name="watchdog"),
+            asyncio.create_task(self._position_sync_loop(), name="position-sync"),
         ]
         tasks[0].add_done_callback(lambda t: None if t.cancelled() else self._on_feed_done(t))
         log.info("moteur démarré (%s, %s)", self.s.mode.value, self.s.symbol)
@@ -195,6 +202,7 @@ class Engine:
         log.info("arrêt : annulation des ordres%s",
                  " et fermeture de la position" if self.s.flatten_on_kill else "")
         try:
+            self.om.exit_reason = "arrêt du bot"
             if self.s.flatten_on_kill:
                 await self.om.flatten()
             else:
@@ -259,6 +267,43 @@ class Engine:
             await asyncio.sleep(60.0)
             await self._save_model()
 
+    async def _watchdog_loop(self) -> None:
+        """Flux figé (plus aucun tick) -> pause des nouvelles entrées, reprise automatique."""
+        limit = self.s.max_feed_silence_s
+        start = time.perf_counter_ns()
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            await asyncio.sleep(1.0)
+            ref = self._last_tick_perf or start
+            silence = (time.perf_counter_ns() - ref) / 1e9
+            if silence > limit:
+                if "flux" not in self.risk.halts:
+                    log.warning("aucun tick depuis %.0f s : nouvelles entrées suspendues "
+                                "(marché fermé ou flux figé)", silence)
+                self.risk.halt("flux", f"flux figé depuis {silence:.0f} s")
+            elif "flux" in self.risk.halts:
+                log.info("flux rétabli : reprise")
+                self.risk.resume("flux")
+
+    async def _position_sync_loop(self) -> None:
+        """LIVE : compare la position MT5 à celle du bot (SL serveur touché, clôture manuelle)."""
+        if self._position_snapshot is None:
+            return
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            await asyncio.sleep(2.0)
+            if self.om.orders:
+                continue
+            fills = self.om.fill_count
+            try:
+                pos, avg = await self._position_snapshot()
+            except Exception:
+                log.exception("lecture de la position MT5")
+                continue
+            if fills != self.om.fill_count or self.om.orders:
+                continue                      # un ordre est passé entre-temps : on réessaiera
+            if abs(pos - self.om.position) > 1e-9:
+                self.om.sync_external(pos, avg, self.last_mid,
+                                      "fermé côté serveur (SL de secours ou manuel)")
+
     async def _telemetry_loop(self) -> None:
         while not self._stop.is_set():  # type: ignore[union-attr]
             await asyncio.sleep(5.0)
@@ -291,6 +336,7 @@ class Engine:
             "strategy": self.strategy.state(),
             "account": self.account_label,
             "journal": self.om.journal.stats() if self.om.journal is not None else None,
+            "by_strategy": self.om.journal.strategy_summary() if self.om.journal is not None else "",
         }
 
     def summary(self) -> str:
@@ -298,6 +344,9 @@ class Engine:
         j = self.om.journal.stats() if self.om.journal is not None else None
         jtxt = (f"journal: {j.trades} trades, {j.win_rate:.0%} gagnants, net {j.net_pnl:+.2f} — "
                 f"{j.verdict} | ") if j else ""
+        if "regime" in st:
+            jtxt = (f"[{st['regime']} · ATR {st.get('atr_pts', 0):.0f} pts · vol×{st.get('vol_ratio', 0):.2f}"
+                    f" · {st.get('reason', '')}] ") + jtxt
         return (jtxt +f"ticks={self.stats.ticks} conflés={self.stats.conflated} pos={self.om.position:+.2f} "
                 f"PnL={self.om.net_pnl(self.last_mid):+.2f} frais={self.om.fees:.2f} "
                 f"fills={self.om.fill_count} score={st.get('score', 0):+.2f} "

@@ -71,6 +71,8 @@ class MT5Gateway:
         self.info: Any = None
         self.order_rtt = LatencyTracker("aller-retour ordre MT5")
         self._throttled_until = 0.0
+        self.hedging = False             # compte hedging : une vente n'annule pas un achat
+        self.supports_passive_reduce = True
         self.latency_cb: Any = None      # appelé avec le RTT (ms) de chaque ordre
 
     # ------------------------------------------------------------------ #
@@ -107,9 +109,16 @@ class MT5Gateway:
                 log.warning("DOM indisponible chez ce broker : repli sur le flux de ticks")
         self.connected = True
         acc = self._call("account_info")
-        log.info("MT5 connecté : compte %s (%s), symbole %s, point=%s, contrat=%s, DOM=%s",
-                 getattr(acc, "login", "?"), getattr(acc, "server", "?"), self.symbol,
-                 self.info.point, self.info.trade_contract_size, self._book_enabled)
+        hedge_mode = getattr(self.mt5, "ACCOUNT_MARGIN_MODE_RETAIL_HEDGING", 2)
+        self.hedging = getattr(acc, "margin_mode", -1) == hedge_mode
+        # en hedging, un ordre limite de sortie ouvrirait une position inverse : sorties au marché
+        self.supports_passive_reduce = not self.hedging
+        log.info("MT5 connecté : compte %s (%s, %s), symbole %s, point=%s, contrat=%s, "
+                 "stops level=%s, freeze level=%s, DOM=%s",
+                 getattr(acc, "login", "?"), getattr(acc, "server", "?"),
+                 "hedging" if self.hedging else "netting", self.symbol, self.info.point,
+                 self.info.trade_contract_size, getattr(self.info, "trade_stops_level", 0),
+                 getattr(self.info, "trade_freeze_level", 0), self._book_enabled)
         return acc
 
     def _pick_filling(self, mode_flags: int) -> int:
@@ -131,7 +140,18 @@ class MT5Gateway:
     def symbol_specs(self) -> dict[str, float]:
         i = self.info
         return {"point": float(i.point), "contract_size": float(i.trade_contract_size),
-                "volume_step": float(i.volume_step), "volume_min": float(i.volume_min)}
+                "volume_step": float(i.volume_step), "volume_min": float(i.volume_min),
+                "stops_level_points": float(getattr(i, "trade_stops_level", 0) or 0),
+                "freeze_level_points": float(getattr(i, "trade_freeze_level", 0) or 0)}
+
+    def recent_m1_bars(self, count: int = 200) -> list[tuple[float, float, float, float]]:
+        """Dernières bougies M1 clôturées (o, h, l, c), de la plus ancienne à la plus récente."""
+        tf = getattr(self.mt5, "TIMEFRAME_M1", 1)
+        rates = self._call("copy_rates_from_pos", self.symbol, tf, 1, count)
+        if rates is None:
+            return []
+        return [(float(r["open"]), float(r["high"]), float(r["low"]), float(r["close"]))
+                for r in rates]
 
     def current_position(self) -> tuple[float, float]:
         """Position nette (lots signés) et prix moyen des positions de ce bot."""
@@ -261,6 +281,9 @@ class MT5Gateway:
     def _submit_blocking(self, order: Order, loop: asyncio.AbstractEventLoop) -> None:
         m = self.mt5
         cid = order.client_order_id
+        if order.order_type is OrderType.MARKET and order.reduce_only and self.hedging:
+            self._close_positions_blocking(order, loop)
+            return
         try:
             if order.order_type is OrderType.MARKET:
                 t = self._call("symbol_info_tick", self.symbol)
@@ -272,6 +295,8 @@ class MT5Gateway:
                     "deviation": self.s.deviation_points, "magic": self.magic, "comment": cid,
                     "type_time": m.ORDER_TIME_GTC, "type_filling": self._filling_market,
                 }
+                if order.sl:
+                    req["sl"] = float(order.sl)
             else:
                 req = {
                     "action": m.TRADE_ACTION_PENDING, "symbol": self.symbol,
@@ -281,6 +306,8 @@ class MT5Gateway:
                     "type_time": m.ORDER_TIME_GTC,
                     "type_filling": self._filling_pending,
                 }
+                if order.sl:
+                    req["sl"] = float(order.sl)
             res = self._send_with_filling(req, order.order_type)
         except Exception as exc:
             self._emit(OrderEvent(EventKind.REJECTED, cid, reason=str(exc)), loop)
@@ -299,6 +326,51 @@ class MT5Gateway:
                 # serveur. On le clôt localement, sinon l'ordre resterait « actif » pour toujours.
                 self._emit(OrderEvent(EventKind.CANCELED, cid, int(res.order),
                                       reason="reliquat IOC non exécuté"), loop)
+
+    def _close_positions_blocking(self, order: Order, loop: asyncio.AbstractEventLoop) -> None:
+        """Compte hedging : ferme les positions du bot par leur ticket (``position``)."""
+        m, cid = self.mt5, order.client_order_id
+        buy_t = getattr(m, "POSITION_TYPE_BUY", 0)
+        # un ordre SELL ferme des positions BUY, et inversement
+        want = buy_t if order.side is Side.SELL else getattr(m, "POSITION_TYPE_SELL", 1)
+        positions = [p for p in (self._call("positions_get", symbol=self.symbol) or ())
+                     if p.magic == self.magic and p.type == want]
+        remaining = float(order.qty)
+        acked = False
+        for p in positions:
+            if remaining <= 1e-9:
+                break
+            vol = min(float(p.volume), remaining)
+            t = self._call("symbol_info_tick", self.symbol)
+            req = {"action": m.TRADE_ACTION_DEAL, "symbol": self.symbol, "volume": vol,
+                   "type": m.ORDER_TYPE_SELL if order.side is Side.SELL else m.ORDER_TYPE_BUY,
+                   "position": int(p.ticket), "price": t.bid if order.side is Side.SELL else t.ask,
+                   "deviation": self.s.deviation_points, "magic": self.magic, "comment": cid,
+                   "type_time": m.ORDER_TIME_GTC, "type_filling": self._filling_market}
+            try:
+                res = self._send_with_filling(req, OrderType.MARKET)
+            except Exception as exc:
+                self._emit(OrderEvent(EventKind.REJECTED, cid, reason=str(exc)), loop)
+                return
+            if res.retcode not in _OK_CODES:
+                if not acked:
+                    self._emit(OrderEvent(EventKind.REJECTED, cid,
+                                          reason=f"{res.retcode} {res.comment}"), loop)
+                    return
+                break
+            if not acked:
+                self._emit(OrderEvent(EventKind.ACK, cid, int(res.order)), loop)
+                acked = True
+            if res.volume > 0:
+                self._emit(OrderEvent(EventKind.FILL, cid, int(res.order), fill_qty=float(res.volume),
+                                      fill_price=float(res.price),
+                                      fee=self._deal_fees(int(res.order))), loop)
+                remaining -= float(res.volume)
+        if not acked:
+            self._emit(OrderEvent(EventKind.REJECTED, cid, reason="aucune position du bot à fermer"),
+                       loop)
+        elif remaining > 1e-9:
+            self._emit(OrderEvent(EventKind.CANCELED, cid, reason="reliquat sans position"), loop)
 
     def _send_with_filling(self, req: dict[str, Any], otype: OrderType) -> Any:
         """Envoie l'ordre ; si le broker refuse le mode de remplissage (10030), essaie les autres
@@ -394,6 +466,9 @@ class MT5Gateway:
                     events.append(OrderEvent(EventKind.CANCELED, o.client_order_id, ticket,
                                              reason="annulé côté serveur"))
         return events
+
+    async def position_snapshot(self) -> tuple[float, float]:
+        return await asyncio.get_running_loop().run_in_executor(self._exec, self.current_position)
 
     async def reconcile(self, tracked: list[Order]) -> list[OrderEvent]:
         return await asyncio.get_running_loop().run_in_executor(

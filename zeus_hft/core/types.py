@@ -80,6 +80,8 @@ class Decision:
     limit_price: float | None = None
     reason: str = ""
     score: float = 0.0
+    stop_points: float | None = None     # SL de la stratégie (sert au SL de secours serveur)
+    strategy: str = ""
 
 
 @dataclass(slots=True)
@@ -98,6 +100,8 @@ class Order:
     updated_ns: int = 0
     tick_recv_ns: int = 0          # horodatage du tick qui a déclenché l'ordre
     reject_reason: str = ""
+    reduce_only: bool = False      # ordre de fermeture (comptes hedging : clôture par ticket)
+    sl: float | None = None        # stop-loss de secours côté serveur
 
     @property
     def remaining(self) -> float:

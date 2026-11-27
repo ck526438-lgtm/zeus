@@ -7,9 +7,14 @@ chemin de décision.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import queue
+import sys
 import threading
+import time
+from pathlib import Path
 import tkinter as tk
 from tkinter import messagebox, ttk
 from typing import Any
@@ -20,6 +25,25 @@ from zeus_hft.core.telemetry import setup_logging
 
 BG, PANEL, FG, MUTED = "#0f1218", "#171c25", "#e8ecf3", "#8a94a6"
 GOLD, GREEN, RED = "#f2b84b", "#3ccf91", "#ff5d6c"
+CONFIG = Path("data/zeus_hft_gui.json")
+STRATEGIES = {"Auto (selon le marché)": "auto", "Momentum / cassure": "momentum",
+              "Mean-reversion": "meanrev", "OBI + IA (v2)": "obi"}
+RETRY_S = 30
+
+
+def _startup_file() -> Path:
+    appdata = os.environ.get("APPDATA", str(Path.home()))
+    return Path(appdata) / "Microsoft/Windows/Start Menu/Programs/Startup/ZeusHFT.cmd"
+
+
+def _launch_command() -> tuple[str, str]:
+    """(dossier de travail, commande) pour relancer l'appli au démarrage de Windows."""
+    if getattr(sys, "frozen", False):                      # .exe PyInstaller
+        exe = Path(sys.executable)
+        return str(exe.parent), f'start "" "{exe}"'
+    py = Path(sys.executable)
+    pyw = py.with_name("pythonw.exe")
+    return os.getcwd(), f'start "" "{pyw if pyw.exists() else py}" -m zeus_hft gui'
 
 
 class _QueueHandler(logging.Handler):
@@ -79,10 +103,15 @@ class App(tk.Tk):
         self.logq: "queue.Queue[str]" = queue.Queue(maxsize=5000)
         setup_logging("INFO", "data/zeus_hft.log", extra_handlers=[_QueueHandler(self.logq)])
         self.thread: EngineThread | None = None
+        self._user_stopped = False
+        self._retry_at = 0.0
         self._style()
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.after(300, self._refresh)
+        if self.autostart.get():
+            logging.getLogger("zeus_hft").info("démarrage automatique dans 3 s…")
+            self.after(3000, lambda: self._start(auto=True))
 
     # ------------------------------------------------------------------ #
     def _style(self) -> None:
@@ -107,38 +136,49 @@ class App(tk.Tk):
         self.status = ttk.Label(head, text="● arrêté", foreground=MUTED)
         self.status.pack(side="right")
 
+        saved = self._load_config()
+        base = Settings()
         cfg = ttk.Frame(self)
         cfg.pack(fill="x", padx=16, pady=4)
-        self.mode = tk.StringVar(value="LIVE")
-        self.symbol = tk.StringVar(value="XAUUSD")
-        self.lot = tk.StringVar(value="0.01")
-        self.maxdd = tk.StringVar(value="300")
-        base = Settings()
-        self.maxspread = tk.StringVar(value=f"{base.max_spread_points:g}")
-        self.tp = tk.StringVar(value=f"{base.take_profit_points:g}")
-        self.sl = tk.StringVar(value=f"{base.stop_loss_points:g}")
-        self.synthetic = tk.BooleanVar(value=False)
-        self.use_model = tk.BooleanVar(value=True)
-        self.confirm_live = tk.BooleanVar(value=False)
+        self.mode = tk.StringVar(value=saved.get("mode", "LIVE"))
+        self.symbol = tk.StringVar(value=saved.get("symbol", "XAUUSD"))
+        self.lot = tk.StringVar(value=saved.get("lot", "0.01"))
+        self.maxdd = tk.StringVar(value=saved.get("maxdd", "300"))
+        self.maxspread = tk.StringVar(value=saved.get("maxspread", f"{base.max_spread_points:g}"))
+        self.strategy = tk.StringVar(value=saved.get("strategy", "Auto (selon le marché)"))
+        self.news = tk.StringVar(value=saved.get("news", base.news_times_utc))
+        self.synthetic = tk.BooleanVar(value=saved.get("synthetic", False))
+        self.use_model = tk.BooleanVar(value=saved.get("use_model", True))
+        self.confirm_live = tk.BooleanVar(value=False)          # jamais mémorisé, par sécurité
+        self.autostart = tk.BooleanVar(value=saved.get("autostart", False))
         for label, w in (
             ("Mode", ttk.Combobox(cfg, textvariable=self.mode, values=["DRY_RUN", "LIVE"],
                                   width=9, state="readonly")),
+            ("Stratégie", ttk.Combobox(cfg, textvariable=self.strategy, values=list(STRATEGIES),
+                                       width=22, state="readonly")),
             ("Symbole", ttk.Entry(cfg, textvariable=self.symbol, width=10)),
             ("Lot", ttk.Entry(cfg, textvariable=self.lot, width=6)),
             ("Perte max/jour", ttk.Entry(cfg, textvariable=self.maxdd, width=7)),
+            ("Spread max (pts)", ttk.Entry(cfg, textvariable=self.maxspread, width=5)),
         ):
             ttk.Label(cfg, text=label).pack(side="left", padx=(0, 4))
-            w.pack(side="left", padx=(0, 12))
+            w.pack(side="left", padx=(0, 10))
 
         cfg2 = ttk.Frame(self)
         cfg2.pack(fill="x", padx=16, pady=4)
-        for label, var in (("Spread max (pts)", self.maxspread), ("Take-profit (pts)", self.tp),
-                           ("Stop-loss (pts)", self.sl)):
-            ttk.Label(cfg2, text=label).pack(side="left", padx=(0, 4))
-            ttk.Entry(cfg2, textvariable=var, width=6).pack(side="left", padx=(0, 12))
+        ttk.Label(cfg2, text="News (UTC, ex. 13:30, 2026-12-04 13:30)").pack(side="left", padx=(0, 4))
+        ttk.Entry(cfg2, textvariable=self.news, width=34).pack(side="left", padx=(0, 12))
         ttk.Checkbutton(cfg2, text="IA adaptative", variable=self.use_model).pack(side="left", padx=4)
         ttk.Checkbutton(cfg2, text="Simulation sans MT5", variable=self.synthetic).pack(side="left", padx=4)
         ttk.Checkbutton(cfg2, text="Autoriser compte réel", variable=self.confirm_live).pack(side="left", padx=4)
+
+        cfg3 = ttk.Frame(self)
+        cfg3.pack(fill="x", padx=16, pady=4)
+        ttk.Checkbutton(cfg3, text="Démarrage automatique (à l'ouverture + relance si MT5 se coupe)",
+                        variable=self.autostart, command=self._save_config).pack(side="left", padx=(0, 12))
+        self.b_boot = ttk.Button(cfg3, text="", command=self._toggle_windows_startup)
+        self.b_boot.pack(side="left")
+        self._update_boot_button()
 
         btns = ttk.Frame(self)
         btns.pack(fill="x", padx=16, pady=8)
@@ -154,9 +194,10 @@ class App(tk.Tk):
         grid.pack(fill="x", padx=16, pady=6)
         self.vals: dict[str, ttk.Label] = {}
         cards = [("bid", "Bid"), ("ask", "Ask"), ("position", "Position (lots)"), ("pnl", "PnL net"),
-                 ("equity", "Equity"), ("fills", "Exécutions"), ("lat", "Décision p50 / p99"),
-                 ("ia", "IA : précision / poids"), ("score", "Score signal"), ("obi", "OBI / flux"),
-                 ("spread", "Spread (pts)"), ("risk", "Risque"),
+                 ("equity", "Equity"), ("fills", "Exécutions"), ("regime", "Régime de marché"),
+                 ("strat", "Stratégie en position"),
+                 ("atr", "ATR M1 (pts) / vol×"), ("spread", "Spread (pts)"),
+                 ("ia", "IA : précision / poids"), ("risk", "Risque"),
                  ("jtrades", "Trades journal / gagnants"), ("jnet", "PnL cumulé (journal)"),
                  ("jpf", "Profit factor (100 derniers)"), ("samples", "IA : exemples appris")]
         for i, (key, title) in enumerate(cards):
@@ -175,12 +216,57 @@ class App(tk.Tk):
         self.account.pack(side="left")
         self.verdict = ttk.Label(bar, text="", style="Panel.TLabel", font=("Segoe UI", 11, "bold"))
         self.verdict.pack(side="right")
+        bar2 = ttk.Frame(self, style="Panel.TFrame", padding=(12, 4))
+        bar2.pack(fill="x", padx=20, pady=(0, 4))
+        self.reason = ttk.Label(bar2, text="", style="Panel.TLabel")
+        self.reason.pack(side="left")
+        self.by_strat = ttk.Label(bar2, text="", style="Panel.TLabel")
+        self.by_strat.pack(side="right")
 
         self.log = tk.Text(self, height=12, bg="#0a0d12", fg="#b9c2d0", insertbackground=FG,
                            relief="flat", font=("Consolas", 9), wrap="none")
         self.log.pack(fill="both", expand=True, padx=16, pady=(6, 14))
 
     # ------------------------------------------------------------------ #
+    @staticmethod
+    def _load_config() -> dict:
+        try:
+            return json.loads(CONFIG.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+
+    def _save_config(self) -> None:
+        data = {"mode": self.mode.get(), "symbol": self.symbol.get(), "lot": self.lot.get(),
+                "maxdd": self.maxdd.get(), "maxspread": self.maxspread.get(),
+                "strategy": self.strategy.get(), "news": self.news.get(),
+                "synthetic": self.synthetic.get(), "use_model": self.use_model.get(),
+                "autostart": self.autostart.get()}
+        try:
+            CONFIG.parent.mkdir(parents=True, exist_ok=True)
+            CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError:
+            pass
+
+    def _update_boot_button(self) -> None:
+        on = _startup_file().exists()
+        self.b_boot.config(text="✓ Lancé avec Windows (retirer)" if on else "Lancer avec Windows")
+
+    def _toggle_windows_startup(self) -> None:
+        f = _startup_file()
+        try:
+            if f.exists():
+                f.unlink()
+            else:
+                cwd, cmd = _launch_command()
+                f.parent.mkdir(parents=True, exist_ok=True)
+                f.write_text(f'@echo off\r\ncd /d "{cwd}"\r\n{cmd}\r\n', encoding="utf-8")
+                if not self.autostart.get():
+                    self.autostart.set(True)
+                    self._save_config()
+        except OSError as exc:
+            messagebox.showerror("Lancer avec Windows", str(exc))
+        self._update_boot_button()
+
     def _settings(self) -> Settings:
         mode = Mode(self.mode.get())
         lot = float(self.lot.get().replace(",", "."))
@@ -190,17 +276,23 @@ class App(tk.Tk):
             "max_net_inventory": max(base.max_net_inventory, lot),
             "max_daily_drawdown": float(self.maxdd.get().replace(",", ".")),
             "max_spread_points": float(self.maxspread.get().replace(",", ".")),
-            "take_profit_points": float(self.tp.get().replace(",", ".")),
-            "stop_loss_points": float(self.sl.get().replace(",", ".")),
+            "strategy": STRATEGIES.get(self.strategy.get(), "auto"),
+            "news_times_utc": self.news.get().strip(),
             "confirm_live": self.confirm_live.get(),
         })
 
-    def _start(self) -> None:
+    def _start(self, auto: bool = False) -> None:
+        if self.thread is not None:
+            return
         try:
             s = self._settings()
+            from zeus_hft.strategies.features import NewsCalendar
+            NewsCalendar(s.news_times_utc, 0, 0)          # valide le format des heures de news
         except ValueError as exc:
             messagebox.showerror("Réglage invalide", str(exc))
             return
+        self._save_config()
+        self._user_stopped = False
         if s.mode is Mode.LIVE:
             if self.synthetic.get():
                 messagebox.showerror("Mode LIVE", "Le mode LIVE exige MetaTrader 5 (décoche « Démo sans MT5 »).")
@@ -212,7 +304,9 @@ class App(tk.Tk):
             if self.confirm_live.get():
                 msg = ("⚠️ « Autoriser compte réel » est coché : si MT5 est connecté à un compte "
                        "RÉEL, de l'argent réel sera engagé.\n\n" + msg)
-            if not messagebox.askyesno("Mode LIVE", msg, icon="warning"):
+            # en démarrage automatique, pas de fenêtre bloquante : le compte réel reste
+            # refusé tant que la case n'est pas cochée (et elle n'est jamais mémorisée)
+            if not auto and not messagebox.askyesno("Mode LIVE", msg, icon="warning"):
                 return
         self.thread = EngineThread(s, self.synthetic.get(), self.use_model.get())
         self.thread.start()
@@ -221,6 +315,7 @@ class App(tk.Tk):
         self.b_kill.state(["!disabled"])
 
     def _stop(self) -> None:
+        self._user_stopped = True
         if self.thread:
             self.thread.stop()
 
@@ -262,10 +357,15 @@ class App(tk.Tk):
             self.vals["fills"].config(text=f"{snap['fills']} / {snap['orders']}")
             self.vals["lat"].config(text=f"{fmt(snap['decision_p50_us'], 0)} / {fmt(snap['decision_p99_us'], 0)} µs")
             self.vals["ia"].config(text=f"{st.get('model_acc', 0):.1%} / {st.get('model_conf', 0):.2f}")
-            sc = st.get("score", 0.0)
-            self.vals["score"].config(text=f"{sc:+.2f}", foreground=GREEN if sc > 0 else RED if sc < 0 else FG)
-            self.vals["obi"].config(text=f"{st.get('obi', 0):+.2f} / {st.get('flow', 0):+.2f}")
+            reg = st.get("regime", "—")
+            self.vals["regime"].config(text=reg, foreground=(GREEN if reg in ("TENDANCE", "NORMAL", "CALME")
+                                                             else RED if reg in ("CHOC", "NEWS") else GOLD))
+            self.vals["strat"].config(text=st.get("strategy", "—"))
+            self.vals["atr"].config(text=f"{st.get('atr_pts', 0):.0f} / {st.get('vol_ratio', 0):.2f}")
             self.vals["spread"].config(text=fmt(st.get("spread_pts"), 1))
+            halts = rk.get("halts") or []
+            self.reason.config(text=("⏸ " + "; ".join(halts)) if halts else f"Décision : {st.get('reason', '')}")
+            self.by_strat.config(text=snap.get("by_strategy", ""))
             j = snap.get("journal")
             if j is not None:
                 self.vals["jtrades"].config(text=f"{j.trades} / {j.win_rate:.0%}")
@@ -280,17 +380,28 @@ class App(tk.Tk):
             self.vals["samples"].config(text=f"{int(st.get('model_samples', 0)):,}")
             self.account.config(text=f"Compte : {snap.get('account') or '—'}")
             killed = rk["killed"]
-            self.vals["risk"].config(text="KILL" if killed else "OK", foreground=RED if killed else GREEN)
+            self.vals["risk"].config(text="KILL" if killed else ("PAUSE" if halts else "OK"),
+                                     foreground=RED if killed else GOLD if halts else GREEN)
             self.status.config(text="● en marche" if snap["running"] else "● arrêt…",
                                foreground=GREEN if snap["running"] else MUTED)
         if t is not None and not t.is_alive():
             if t.error:
-                messagebox.showerror("Zeus HFT", t.error)
+                if self.autostart.get() and not self._user_stopped:
+                    # mode automatique : pas de fenêtre bloquante, on retente plus tard
+                    logging.getLogger("zeus_hft").warning(
+                        "le moteur s'est arrêté (%s) : nouvel essai dans %d s", t.error, RETRY_S)
+                    self._retry_at = time.monotonic() + RETRY_S
+                else:
+                    messagebox.showerror("Zeus HFT", t.error)
             self.thread = None
             self.status.config(text="● arrêté", foreground=MUTED)
             self.b_start.state(["!disabled"])
             self.b_stop.state(["disabled"])
             self.b_kill.state(["disabled"])
+        if (self.thread is None and self._retry_at and time.monotonic() >= self._retry_at
+                and not self._user_stopped):
+            self._retry_at = 0.0
+            self._start(auto=True)
         self.after(300, self._refresh)
 
 

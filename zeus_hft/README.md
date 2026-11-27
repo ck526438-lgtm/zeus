@@ -97,6 +97,75 @@ Options utiles : `--symbol`, `--lot`, `--max-dd`, `--max-inventory`, `--no-model
 Tous les réglages : [`config/settings.py`](config/settings.py), surchargeables par
 variables `ZEUS_HFT_*` (voir `.env.example`).
 
+## 🎯 Les stratégies (v2.2) et le mode automatique
+
+En mode **Auto** (par défaut), le bot lit le **régime de marché** à chaque tick et choisit
+lui-même la stratégie. Le régime courant est affiché dans l'appli.
+
+| Régime | Quand | Stratégie autorisée |
+|---|---|---|
+| **TENDANCE / NORMAL** | sessions de Londres (07:00–11:00) et New York (13:30–17:00 UTC), volatilité 0,6 à 2,5 × la normale | **1. Momentum / cassure** |
+| **CALME** | fin de séance US (19:30–21:30) et nuit (00:30–06:00 UTC), volatilité ≤ 1,1 × la normale | **2. Micro mean-reversion** |
+| **OUVERTURE** | 5 premières minutes de Londres et de New York | aucune (slippage) |
+| **NEWS** | 5 min avant à 15 min après chaque heure de news saisie | aucune |
+| **CHOC** | le prix bouge de plus de 2 ATR en 2 s (news imprévue) | aucune pendant 2 min |
+| **HORS-SESSION** | le reste du temps | aucune |
+
+**1. Scalping momentum / cassure.** Le prix casse le plus haut (ou le plus bas) des 60
+dernières secondes, et la vitesse sur 2 s dépasse 0,45 × ATR M1. Entrée **au marché**, TP court
+(0,8 ATR), **SL serré** (0,5 ATR), 60 s maximum, sortie si la vitesse se retourne.
+
+**2. Micro mean-reversion.** Le prix s'écarte d'au moins 1,2 ATR de la moyenne courte
+(EMA ; le VWAP intrajournalier est disponible en option) et l'extension **ralentit**. Entrée en
+**ordre limite**, ce qui évite de payer le spread à l'entrée. Sortie au retour vers la moyenne, avec un
+**SL strict** (1,2 ATR) et une durée maximale. Le bot **sort au marché dès que la volatilité monte**, car sur
+l'or une extension peut vite devenir une tendance de 200+ pips.
+
+**3. Grille / martingale : volontairement absente.** Le bot n'ouvre qu'**une seule position, à
+taille fixe** : l'inventaire maximum est plafonné au lot, et il ne renforce jamais une
+position perdante.
+
+**Filtre de coût :** aucune entrée si le gain visé est inférieur à **2,5 × le spread**. Avec un
+spread élevé, le bot préfère ne pas trader.
+
+**L'IA** (OBI + flux) continue d'apprendre à chaque tick et sert de **veto** : quand elle est
+confiante dans le sens opposé, l'entrée est refusée.
+
+### Sécurités MT5 (avant chaque ordre)
+- **Spread en direct** comparé au plafond : entrée refusée au-delà (les sorties restent permises).
+- **Stops level / freeze level** du broker lus au démarrage : prix des ordres limites et SL
+  ajustés, pas de modification d'un ordre « gelé » (évite `INVALID_STOPS`).
+- **SL de secours côté serveur** (1,5 × le SL de la stratégie) sur chaque entrée : la position
+  est protégée même si le PC ou le bot s'arrête.
+- **Comptes hedging** détectés : les sorties ferment la position **par son ticket**, au lieu
+  d'ouvrir une position inverse.
+- **Kill-switch** : perte du jour (montant **et** % du capital, reprise automatique le lendemain
+  00:00 UTC), 5 rejets d'ordre de suite, latence > 150 ms, **flux figé** (aucun tick depuis 30 s :
+  pause, puis reprise automatique).
+- **Resynchronisation** : si une position est fermée hors du bot (SL serveur, clôture manuelle),
+  le bot s'en aperçoit en 2 s et l'inscrit au journal.
+
+### Fonctionnement 100 % automatique
+1. Dans l'appli, coche **« Démarrage automatique »** : le bot démarre seul à l'ouverture et
+   **se relance toutes les 30 s** si MT5 n'est pas encore prêt.
+2. Clique sur **« Lancer avec Windows »** : l'appli s'ouvre à chaque démarrage du PC.
+3. Saisis les heures de news de la semaine (UTC), par exemple `13:30` pour les chiffres
+   américains, ou `2026-12-04 13:30` pour le NFP.
+4. Réglages, mémoire de l'IA et journal sont conservés dans `data/`. Seule la case
+   « Autoriser compte réel » n'est **jamais** mémorisée, par sécurité.
+
+L'ATR M1 est pré-chargé depuis l'historique MT5 : le bot peut trader dès la première minute.
+
+### Backtest réaliste
+Le bot est en Python et non en MQL5 : il ne passe donc pas par le Strategy Tester de MT5.
+L'équivalent du mode « Every tick based on real ticks » est le suivant :
+```bash
+ZeusHFT.exe download --symbol XAUUSD --days 10       # vrais ticks de TON broker
+ZeusHFT.exe backtest --csv data/XAUUSD_ticks.csv --utc-offset 2 --strategy auto
+```
+Le backtest inclut la latence (40 ms), le slippage (2 points), la commission et l'exécution
+prudente des ordres limites. Il donne le résultat **par stratégie** et le temps passé dans chaque régime.
+
 ## 🎓 Le laisser apprendre sur un compte démo MT5
 
 C'est l'usage recommandé : de **vrais ordres**, dans les vraies conditions du broker
@@ -159,7 +228,11 @@ zeus_hft/
 ├── core/ringbuffer.py, types.py
 ├── feeds/mt5_gateway.py      # MT5 : flux, ordres, cancel/replace, fills partiels, backoff
 ├── feeds/synthetic.py        # marché synthétique avec DOM
-├── strategies/hft_strategy.py  # OBI + micro-momentum + filtres + sorties
+├── strategies/router.py        # mode Auto : régime de marché -> stratégie
+├── strategies/features.py      # bougies M1, ATR, micro-range, vitesse, VWAP, sessions, news
+├── strategies/momentum_breakout.py  # stratégie 1 : momentum / cassure
+├── strategies/mean_reversion.py     # stratégie 2 : micro mean-reversion
+├── strategies/hft_strategy.py  # OBI + micro-momentum + IA
 ├── strategies/online_model.py  # IA en ligne auto-évaluée
 ├── execution/order_manager.py  # cycle de vie, client_order_id déterministes, anti-doublons
 ├── execution/sim_exchange.py   # latence, slippage, frais maker/taker (paper + backtest)
