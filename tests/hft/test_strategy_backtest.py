@@ -133,6 +133,7 @@ LONDON_0700_UTC = 1_767_603_600_000   # 2026-01-05 09:00 heure serveur = 07:00 U
 
 
 async def test_backtest_auto_router_trades_momentum_in_session(s: Settings) -> None:
+    s = s.model_copy(update={"trend_filter": False})       # pas d'historique H1 en synthétique
     rep = await run_backtest(s, synthetic_updates(25_000, seed=5, start_ts_ms=LONDON_0700_UTC))
     assert "momentum" in rep.by_strategy
     assert rep.regimes.get("TENDANCE", 0) + rep.regimes.get("NORMAL", 0) > 10_000

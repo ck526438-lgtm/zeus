@@ -18,7 +18,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FIELDS = ["close_time_utc", "mode", "symbol", "side", "qty", "entry_price", "exit_price",
-          "duration_s", "gross_pnl", "fees", "net_pnl", "reason", "strategy"]
+          "duration_s", "gross_pnl", "fees", "net_pnl", "reason", "strategy",
+          "entry_spread_pts", "slippage_pts", "exec_latency_ms"]
 
 
 @dataclass(slots=True)
@@ -36,12 +37,16 @@ class TradeRecord:
     net_pnl: float
     reason: str = ""
     strategy: str = ""
+    entry_spread_pts: float = 0.0
+    slippage_pts: float = 0.0
+    exec_latency_ms: float = 0.0
 
     def row(self) -> list[object]:
         return [self.close_time_utc, self.mode, self.symbol, self.side, round(self.qty, 4),
                 round(self.entry_price, 5), round(self.exit_price, 5), round(self.duration_s, 2),
                 round(self.gross_pnl, 4), round(self.fees, 4), round(self.net_pnl, 4), self.reason,
-                self.strategy]
+                self.strategy, round(self.entry_spread_pts, 1), round(self.slippage_pts, 2),
+                round(self.exec_latency_ms, 1)]
 
 
 @dataclass(slots=True)
@@ -80,6 +85,7 @@ class TradeJournal:
         self.losses = 0.0
         self.recent: deque[float] = deque(maxlen=window)
         self.by_strategy: dict[str, list[float]] = {}     # stratégie -> [trades, net, gains, pertes]
+        self.records: list[TradeRecord] = []                # trades de cette session (Monte Carlo)
         self._q: queue.SimpleQueue[TradeRecord | None] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         if self.path is not None:
@@ -146,11 +152,15 @@ class TradeJournal:
 
     # ------------------------------------------------------------------ #
     def record(self, side: str, qty: float, entry: float, exit_: float, duration_s: float,
-               gross: float, fees: float, reason: str = "", strategy: str = "") -> TradeRecord:
+               gross: float, fees: float, reason: str = "", strategy: str = "",
+               entry_spread_pts: float = 0.0, slippage_pts: float = 0.0,
+               exec_latency_ms: float = 0.0) -> TradeRecord:
         rec = TradeRecord(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), self.mode,
                           self.symbol, side, qty, entry, exit_, duration_s, gross, fees,
-                          gross - fees, reason, strategy)
+                          gross - fees, reason, strategy, entry_spread_pts, slippage_pts,
+                          exec_latency_ms)
         self._account(rec.net_pnl, strategy)
+        self.records.append(rec)
         if self._thread is not None:
             self._q.put(rec)
         return rec

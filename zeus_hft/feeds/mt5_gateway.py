@@ -141,12 +141,19 @@ class MT5Gateway:
         i = self.info
         return {"point": float(i.point), "contract_size": float(i.trade_contract_size),
                 "volume_step": float(i.volume_step), "volume_min": float(i.volume_min),
+                "volume_max": float(getattr(i, "volume_max", 100.0) or 100.0),
+                "tick_value": float(getattr(i, "trade_tick_value", 0.0) or 1.0),
+                "tick_size": float(getattr(i, "trade_tick_size", 0.0) or i.point),
                 "stops_level_points": float(getattr(i, "trade_stops_level", 0) or 0),
                 "freeze_level_points": float(getattr(i, "trade_freeze_level", 0) or 0)}
 
     def recent_m1_bars(self, count: int = 200) -> list[tuple[float, float, float, float]]:
         """Dernières bougies M1 clôturées (o, h, l, c), de la plus ancienne à la plus récente."""
-        tf = getattr(self.mt5, "TIMEFRAME_M1", 1)
+        return self.recent_bars("M1", count)
+
+    def recent_bars(self, tf_name: str, count: int) -> list[tuple[float, float, float, float]]:
+        """Dernières bougies clôturées d'une unité de temps (M1, M15, H1...)."""
+        tf = getattr(self.mt5, f"TIMEFRAME_{tf_name}", 1)
         rates = self._call("copy_rates_from_pos", self.symbol, tf, 1, count)
         if rates is None:
             return []
@@ -466,6 +473,34 @@ class MT5Gateway:
                     events.append(OrderEvent(EventKind.CANCELED, o.client_order_id, ticket,
                                              reason="annulé côté serveur"))
         return events
+
+    def modify_sl_blocking(self, sl: float, is_long: bool) -> int:
+        """Resserre le SL serveur de toutes les positions du bot (TRADE_ACTION_SLTP)."""
+        m = self.mt5
+        want = getattr(m, "POSITION_TYPE_BUY", 0) if is_long else getattr(m, "POSITION_TYPE_SELL", 1)
+        done = 0
+        for p in self._call("positions_get", symbol=self.symbol) or ():
+            if p.magic != self.magic or p.type != want:
+                continue
+            cur = float(getattr(p, "sl", 0.0) or 0.0)
+            if cur and ((sl <= cur) if is_long else (sl >= cur)):
+                continue                                   # on ne desserre jamais un stop
+            try:
+                res = self._send({"action": m.TRADE_ACTION_SLTP, "symbol": self.symbol,
+                                  "position": int(p.ticket), "sl": float(sl),
+                                  "tp": float(getattr(p, "tp", 0.0) or 0.0), "magic": self.magic})
+            except Exception as exc:
+                log.warning("SL serveur non modifié : %s", exc)
+                continue
+            if res.retcode in _OK_CODES:
+                done += 1
+            else:
+                log.warning("SL serveur refusé (%s %s)", res.retcode, res.comment)
+        return done
+
+    async def modify_sl(self, sl: float, is_long: bool) -> int:
+        return await asyncio.get_running_loop().run_in_executor(
+            self._exec, self.modify_sl_blocking, sl, is_long)
 
     async def position_snapshot(self) -> tuple[float, float]:
         return await asyncio.get_running_loop().run_in_executor(self._exec, self.current_position)

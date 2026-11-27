@@ -10,6 +10,7 @@ DRY_RUN et le backtest (fidélité du backtest). La boucle temps réel ajoute :
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import time
 from dataclasses import dataclass, field
@@ -131,6 +132,11 @@ class Engine:
             return
         age_ms = (now - self.book.last_update_ns) / 1e6
         self.stats.actions += await self.om.execute(decision, top, t0, age_ms)
+        pop = getattr(self.strategy, "pop_protective_sl", None)
+        if pop is not None:
+            sl = pop()
+            if sl is not None:
+                await self.om.update_protective_sl(sl, top)
 
     async def _handle_kill(self, t0: int) -> None:
         if not self._kill_handled:
@@ -167,6 +173,7 @@ class Engine:
             asyncio.create_task(self._model_save_loop(), name="model-save"),
             asyncio.create_task(self._watchdog_loop(), name="watchdog"),
             asyncio.create_task(self._position_sync_loop(), name="position-sync"),
+            asyncio.create_task(self._news_loop(), name="news"),
         ]
         tasks[0].add_done_callback(lambda t: None if t.cancelled() else self._on_feed_done(t))
         log.info("moteur démarré (%s, %s)", self.s.mode.value, self.s.symbol)
@@ -266,6 +273,34 @@ class Engine:
         while not self._stop.is_set():  # type: ignore[union-attr]
             await asyncio.sleep(60.0)
             await self._save_model()
+
+    async def _news_loop(self) -> None:
+        """Recharge chaque minute le calendrier exporté par ZeusNewsExporter.mq5 (si présent)."""
+        update = getattr(self.strategy, "update_news", None)
+        path = self.s.resolved_news_file()
+        if update is None or not path:
+            return
+        from zeus_hft.strategies.news_file import load_news_csv
+
+        last_mtime = -1.0
+        warned = False
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            try:
+                mtime = await asyncio.to_thread(os.path.getmtime, path)
+                if mtime != last_mtime:
+                    events = await asyncio.to_thread(load_news_csv, path)
+                    update(events)
+                    last_mtime = mtime
+                    log.info("calendrier MT5 : %d annonces à fort impact chargées", len(events))
+                    if (time.time() - mtime) > 3 * 3600:
+                        log.warning("calendrier MT5 ancien (%.0f h) : ZeusNewsExporter tourne-t-il ?",
+                                    (time.time() - mtime) / 3600)
+            except OSError:
+                if not warned:
+                    log.warning("calendrier MT5 introuvable (%s) : installe ZeusNewsExporter.mq5 "
+                                "ou saisis les heures de news à la main", path)
+                    warned = True
+            await asyncio.sleep(60.0)
 
     async def _watchdog_loop(self) -> None:
         """Flux figé (plus aucun tick) -> pause des nouvelles entrées, reprise automatique."""

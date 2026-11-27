@@ -49,7 +49,7 @@ jobs:
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item dist\ZeusHFT.exe, dist\ZeusHFT-App.exe, .env.example, zeus_hft\README.md release\
+          Copy-Item dist\ZeusHFT.exe, dist\ZeusHFT-App.exe, .env.example, zeus_hft\README.md, mql5\ZeusNewsExporter.mq5 release\
           Compress-Archive -Path release\* -DestinationPath ZeusHFT-windows.zip -Force
 
       - uses: actions/upload-artifact@v4

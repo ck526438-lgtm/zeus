@@ -102,6 +102,9 @@ class Order:
     reject_reason: str = ""
     reduce_only: bool = False      # ordre de fermeture (comptes hedging : clôture par ticket)
     sl: float | None = None        # stop-loss de secours côté serveur
+    req_price: float = 0.0         # prix demandé (télémétrie : slippage)
+    req_spread_pts: float = 0.0    # spread au moment de l'envoi
+    sent_ns: int = 0               # horodatage d'envoi (télémétrie : latence)
 
     @property
     def remaining(self) -> float:

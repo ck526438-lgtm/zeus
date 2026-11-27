@@ -51,6 +51,7 @@ class BacktestReport:
     kill_reason: str = ""
     model_accuracy: float = 0.0
     by_strategy: str = ""
+    trade_pnls: list[float] = field(default_factory=list)
     regimes: dict[str, int] = field(default_factory=dict)
     decision_latency: LatencyStats | None = None
     equity_curve: list[tuple[int, float]] = field(default_factory=list)
@@ -85,7 +86,9 @@ class BacktestReport:
 
 async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_model: bool = True,
                        touch_fill: float = 0.0, equity_every: int = 100,
-                       export_equity: str | None = None) -> BacktestReport:
+                       export_equity: str | None = None,
+                       seed_bars: dict[str, list[tuple[int, float, float, float, float]]] | None = None
+                       ) -> BacktestReport:
     clock = SimClock()
     sim = SimExchange(point=s.point, contract_size=s.contract_size, latency_ms=s.sim_latency_ms,
                       slippage_points=s.sim_slippage_points, maker_fee_bps=s.maker_fee_bps,
@@ -99,17 +102,29 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
     om = OrderManager(s.symbol, sim, risk, point=s.point, volume_step=s.volume_step,
                       volume_min=s.volume_min, contract_size=s.contract_size, session_id=0,
                       clock_ns=clock, journal=journal, stops_level_points=s.stops_level_points,
-                      freeze_level_points=s.freeze_level_points)
+                      freeze_level_points=s.freeze_level_points,
+                      risk_per_trade_pct=s.risk_per_trade_pct,
+                      money_per_point_1lot=s.money_per_point(1.0),
+                      volume_max=s.volume_max, max_lots=s.max_lots)
     strat = StrategyRouter(s, use_model=use_model, realtime=False)
     eng = Engine(s, OrderBook(s.symbol, max_depth=50), strat, om, risk, sim=sim,
                  clock_ns=clock, realtime=False)
 
+    seeded = False
     rep = BacktestReport()
     peak = s.starting_equity
     flat_pnl = 0.0
     was_open = False
     last: MarketUpdate | None = None
     for upd in updates:
+        if not seeded:
+            seeded = True
+            if seed_bars:
+                # historique M15/H1 antérieur au 1er tick : le filtre de tendance est prêt d'emblée
+                t0 = upd.tick.exchange_ts_ms
+                for tf, tgt, minutes in (("M15", strat.f.trend.m15, 15), ("H1", strat.f.trend.h1, 60)):
+                    # seulement les bougies entièrement CLÔTURÉES avant le 1er tick (pas de biais futur)
+                    tgt.seed([b[1:] for b in seed_bars.get(tf, []) if b[0] + minutes * 60_000 <= t0])
         clock.now = upd.tick.exchange_ts_ms * 1_000_000
         upd.tick.recv_ts_ns = clock.now
         await eng.process(upd)
@@ -159,6 +174,7 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
     rep.kill_reason = risk.kill_reason
     rep.model_accuracy = strat.model.accuracy if strat.model else 0.0
     rep.by_strategy = journal.strategy_summary()
+    rep.trade_pnls = [r.net_pnl for r in journal.records]
     rep.decision_latency = eng.decision_latency.stats()
     if export_equity:
         Path(export_equity).parent.mkdir(parents=True, exist_ok=True)
@@ -172,6 +188,7 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
 def report_dict(rep: BacktestReport) -> dict[str, object]:
     d = asdict(rep)
     d.pop("equity_curve")
+    d.pop("trade_pnls")
     d["win_rate"] = rep.win_rate
     d["profit_factor"] = rep.profit_factor
     return d

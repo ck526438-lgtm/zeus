@@ -5,7 +5,9 @@
     python -m zeus_hft run --mode LIVE                 # ordres réels (compte démo conseillé)
     python -m zeus_hft backtest --synthetic 200000
     python -m zeus_hft backtest --csv data/XAUUSD_ticks.csv
-    python -m zeus_hft download --symbol XAUUSD --days 5
+    python -m zeus_hft download --symbol XAUUSD --days 60
+    python -m zeus_hft walkforward --csv data/XAUUSD_ticks.csv --train-days 20 --test-days 5
+    python -m zeus_hft montecarlo --trades data/zeus_hft_trades.csv
     python -m zeus_hft gui
 """
 from __future__ import annotations
@@ -90,17 +92,71 @@ def cmd_backtest(a: argparse.Namespace) -> int:
     setup_logging("WARNING", None)
     if a.utc_offset is not None:
         s = s.model_copy(update={"server_utc_offset_hours": a.utc_offset})
+    seed: dict[str, list[tuple[int, float, float, float, float]]] = {}
     if a.csv:
+        from zeus_hft.backtest.data import bars_path, load_bars_csv
+
         updates = load_ticks_csv(a.csv, s.symbol)
+        seed = {tf: load_bars_csv(bars_path(a.csv, s.symbol, tf)) for tf in ("M15", "H1")}
+        if s.trend_filter and not all(seed.values()):
+            print("⚠ historique M15/H1 absent (relance « download ») : le filtre de tendance "
+                  "attendra ~2 jours de ticks avant d'autoriser des trades")
     else:
         updates = synthetic_updates(a.synthetic or 200_000, symbol=s.symbol, seed=a.seed, point=s.point)
+        if s.trend_filter:
+            s = s.model_copy(update={"trend_filter": False})
+            print("ℹ données synthétiques : filtre de tendance H1/M15 désactivé (pas d'historique)")
     rep = run_async(run_backtest(s, updates, use_model=not a.no_model, touch_fill=a.touch_fill,
-                                 export_equity=a.export))
+                                 export_equity=a.export, seed_bars=seed))
     shutdown_logging()
     if a.json:
         print(json.dumps(report_dict(rep), default=str, indent=2))
     else:
         print(rep.text())
+    if a.montecarlo and rep.trade_pnls:
+        from zeus_hft.backtest.montecarlo import monte_carlo
+
+        print()
+        print(monte_carlo(rep.trade_pnls, sims=a.montecarlo, equity=s.starting_equity,
+                          extra_cost_mean=a.mc_cost).text())
+    return 0
+
+
+def _settings_from(a: argparse.Namespace) -> Settings:
+    s = _settings(a, Mode.BACKTEST)
+    if getattr(a, "utc_offset", None) is not None:
+        s = s.model_copy(update={"server_utc_offset_hours": a.utc_offset})
+    return s
+
+
+def cmd_walkforward(a: argparse.Namespace) -> int:
+    from zeus_hft.app.factory import run_async
+    from zeus_hft.backtest.data import bars_path, load_bars_csv, load_ticks_csv
+    from zeus_hft.backtest.walkforward import run_walkforward
+
+    s = _settings_from(a)
+    setup_logging("WARNING", None)
+    print(f"chargement de {a.csv}…")
+    ups = list(load_ticks_csv(a.csv, s.symbol))
+    seed = {tf: load_bars_csv(bars_path(a.csv, s.symbol, tf)) for tf in ("M15", "H1")}
+    grid = json.loads(a.grid) if a.grid else None
+    rep = run_async(run_walkforward(s, ups, train_days=a.train_days, test_days=a.test_days,
+                                    grid=grid, min_trades=a.min_trades, seed_bars=seed,
+                                    progress=print))
+    shutdown_logging()
+    print(rep.text())
+    return 0
+
+
+def cmd_montecarlo(a: argparse.Namespace) -> int:
+    from zeus_hft.backtest.montecarlo import load_journal_pnls, monte_carlo
+
+    pnls = load_journal_pnls(a.trades, a.mode, a.strategy)
+    if not pnls:
+        print("aucun trade correspondant dans le journal")
+        return 1
+    print(monte_carlo(pnls, sims=a.sims, skip_prob=a.skip, extra_cost_mean=a.cost,
+                      equity=a.equity, ruin_pct=a.ruin_pct).text())
     return 0
 
 
@@ -156,6 +212,31 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--export", help="CSV de la courbe d'equity")
     b.add_argument("--utc-offset", type=float,
                    help="décalage heure serveur MT5 - UTC en heures (souvent 2 ou 3)")
+    b.add_argument("--montecarlo", type=int, default=0, metavar="N",
+                   help="ajoute N simulations de Monte Carlo sur les trades du backtest")
+    b.add_argument("--mc-cost", type=float, default=0.0,
+                   help="coût défavorable moyen ajouté par trade (devise du compte)")
+
+    w = sub.add_parser("walkforward", help="optimisation glissante + validation hors échantillon")
+    common(w)
+    w.add_argument("--csv", required=True)
+    w.add_argument("--train-days", type=float, default=20.0)
+    w.add_argument("--test-days", type=float, default=5.0)
+    w.add_argument("--min-trades", type=int, default=10)
+    w.add_argument("--grid", help='JSON, ex. \'{"velocity_entry_atr": [0.35, 0.5]}\'')
+    w.add_argument("--utc-offset", type=float)
+    w.set_defaults(fn=cmd_walkforward)
+
+    m = sub.add_parser("montecarlo", help="robustesse : Monte Carlo sur le journal des trades")
+    m.add_argument("--trades", default="data/zeus_hft_trades.csv")
+    m.add_argument("--mode", default="LIVE", help="LIVE, DRY_RUN ou '' pour tout")
+    m.add_argument("--strategy", help="momentum, meanrev, obi…")
+    m.add_argument("--sims", type=int, default=5000)
+    m.add_argument("--skip", type=float, default=0.05, help="part de trades manqués")
+    m.add_argument("--cost", type=float, default=0.0, help="coût défavorable moyen par trade")
+    m.add_argument("--equity", type=float, default=10_000.0)
+    m.add_argument("--ruin-pct", type=float, default=20.0)
+    m.set_defaults(fn=cmd_montecarlo)
     b.add_argument("--json", action="store_true")
     b.set_defaults(fn=cmd_backtest)
 

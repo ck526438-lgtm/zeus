@@ -20,6 +20,8 @@ from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timezone
 
+from zeus_hft.strategies.trend import TrendFilter
+
 MS_DAY = 86_400_000
 
 
@@ -59,8 +61,21 @@ class NewsCalendar:
                 self.daily.append(_hm(item))
         self.before_ms = int(before_min * 60_000)
         self.after_ms = int(after_min * 60_000)
+        self.file_events: list[tuple[int, str]] = []      # (ms UTC, libellé) du calendrier MT5
+
+    def set_file_events(self, events: list[tuple[int, str]]) -> None:
+        self.file_events = sorted(events)
+
+    def next_event(self, utc_ms: int) -> tuple[int, str] | None:
+        for t, name in self.file_events:
+            if t + self.after_ms >= utc_ms:
+                return t, name
+        return None
 
     def blocked(self, utc_ms: int) -> bool:
+        for t, _ in self.file_events:
+            if t - self.before_ms <= utc_ms <= t + self.after_ms:
+                return True
         for t in self.dated:
             if t - self.before_ms <= utc_ms <= t + self.after_ms:
                 return True
@@ -117,6 +132,10 @@ class MarketFeatures:
         self._mom_win = parse_windows(s.momentum_sessions_utc)
         self._mr_win = parse_windows(s.meanrev_sessions_utc)
         self._opens = [_hm(x) for x in s.session_opens_utc.split(",") if x.strip()]
+        self._blackout = parse_windows(s.blackout_sessions_utc)
+        self.trend = TrendFilter(s)
+        self.spread_avg = 0.0
+        self._a_spread = 1.0 / 2000
         self.news = NewsCalendar(s.news_times_utc, s.news_before_min, s.news_after_min)
         rw = int(s.range_window_s * 1000)
         self._hi = _WindowExtremum(rw, True)
@@ -189,6 +208,8 @@ class MarketFeatures:
         self.spread_pts = (ask - bid) / self.point
         self.utc_ms = ts_ms - (self.utc_offset_ms or 0)
         self.ticks += 1
+        self.spread_avg = (self.spread_pts if self.ticks == 1
+                           else self.spread_avg + self._a_spread * (self.spread_pts - self.spread_avg))
 
         # micro-range AVANT d'ajouter le tick courant (pour détecter la cassure)
         self.range_hi = self._hi.value(ts_ms)
@@ -232,6 +253,8 @@ class MarketFeatures:
                 self.atr_base = (self.atr if self.bars == 1
                                  else self.atr_base + self._a_base * (self.atr - self.atr_base))
                 self._prev_close = c
+                utc_minute = (self._bar_min * 60_000 - (self.utc_offset_ms or 0)) // 60_000
+                self.trend.on_m1(utc_minute, o, h, l, c)
             self._bar_min = minute
             b[0] = b[1] = b[2] = b[3] = mid
         else:
@@ -257,6 +280,8 @@ class MarketFeatures:
         for o in self._opens:
             if 0 <= (minute - o) % 1440 < s.session_open_blackout_min:
                 return Regime("OUVERTURE")
+        if in_windows(minute, self._blackout):
+            return Regime("ROLLOVER")
         vr = self.vol_ratio
         mom = in_windows(minute, self._mom_win) and s.mom_min_vol_ratio <= vr <= s.mom_max_vol_ratio
         mr = (in_windows(minute, self._mr_win) and vr <= s.mr_max_vol_ratio
@@ -276,6 +301,9 @@ class MarketFeatures:
                 "vol_ratio": round(self.vol_ratio, 2),
                 "velocity_pts": round(self.velocity / self.point, 1),
                 "vwap": round(self.vwap, 3),
+                "spread_avg": round(self.spread_avg, 1),
+                "h1_dir": self.trend.h1.direction, "m15_dir": self.trend.m15.direction,
+                "adx_m15": round(self.trend.m15.adx, 1), "trend_ready": self.trend.ready,
                 "utc_offset_h": (self.utc_offset_ms or 0) / 3_600_000}
 
 

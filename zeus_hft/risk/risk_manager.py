@@ -56,6 +56,8 @@ class RiskLimits:
     max_spread_points: float = 0.0          # 0 = pas de plafond
     max_daily_loss_pct: float = 0.0         # % de l'equity du début de journée (0 = off)
     max_consecutive_rejects: int = 5
+    max_consecutive_losses: int = 0          # 0 = off
+    loss_streak_pause_min: float = 120.0     # 0 = jusqu'au lendemain
 
 
 def _utc_day(ts_s: float) -> int:
@@ -78,8 +80,10 @@ class RiskManager:
         self.killed = False
         self.kill_reason = ""
         self._kill_daily = False           # True : levé automatiquement le jour suivant (UTC)
-        self.halts: dict[str, str] = {}    # pauses temporaires (flux figé, horloge...)
+        self.halts: dict[str, str] = {}    # pauses temporaires (flux figé, série de pertes...)
+        self._halt_until: dict[str, int] = {}
         self._rejects = 0
+        self.loss_streak = 0
         self.equity = starting_equity
         self.day_start_equity = starting_equity
         self.day_peak_equity = starting_equity
@@ -102,11 +106,36 @@ class RiskManager:
             if self._on_kill is not None:
                 self._on_kill(reason)
 
-    def halt(self, key: str, reason: str) -> None:
+    def halt(self, key: str, reason: str, duration_s: float | None = None) -> None:
         self.halts[key] = reason
+        if duration_s is not None:
+            self._halt_until[key] = self._clock_ns() + int(duration_s * 1e9)
 
     def resume(self, key: str) -> None:
         self.halts.pop(key, None)
+        self._halt_until.pop(key, None)
+
+    def _expire_halts(self) -> None:
+        if self._halt_until:
+            now = self._clock_ns()
+            for k, t in list(self._halt_until.items()):
+                if now >= t:
+                    self.resume(k)
+
+    def record_trade(self, net_pnl: float) -> None:
+        """Après chaque aller-retour : série de pertes -> pause (changement de régime probable)."""
+        if net_pnl > 0:
+            self.loss_streak = 0
+            return
+        self.loss_streak += 1
+        n = self.limits.max_consecutive_losses
+        if n and self.loss_streak >= n:
+            self.loss_streak = 0
+            pause = self.limits.loss_streak_pause_min
+            if pause > 0:
+                self.halt("pertes", f"{n} pertes de suite : pause {pause:.0f} min", pause * 60)
+            else:
+                self.kill(f"{n} pertes de suite (reprise demain 00:00 UTC)", daily=True)
 
     def record_execution_error(self, reason: str) -> None:
         self._rejects += 1
@@ -197,6 +226,7 @@ class RiskManager:
         if data_age_ms > self.limits.max_data_staleness_ms:
             return self._reject(RiskReason.STALE_DATA, f"{data_age_ms:.0f} ms")
         if not reduces:
+            self._expire_halts()
             if self.halts:
                 return self._reject(RiskReason.HALTED, "; ".join(self.halts.values()))
             if 0 < self.limits.max_spread_points < spread_points:

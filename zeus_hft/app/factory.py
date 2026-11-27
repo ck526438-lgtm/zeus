@@ -47,10 +47,11 @@ def run_async(coro: Awaitable[T]) -> T:
 def _limits(s: Settings) -> RiskLimits:
     # Une seule position, taille fixe : l'inventaire max est plafonné au lot (pas de grille,
     # pas de martingale, pas de renforcement contre la tendance).
-    return RiskLimits(s.max_daily_drawdown, min(s.max_net_inventory, s.order_qty),
+    max_inv = s.max_lots if s.risk_per_trade_pct > 0 else min(s.max_net_inventory, s.order_qty)
+    return RiskLimits(s.max_daily_drawdown, max_inv,
                       s.max_orders_per_second, s.max_latency_ms, s.latency_breaches_to_kill,
                       s.max_data_staleness_ms, s.max_spread_points, s.max_daily_loss_pct,
-                      s.max_consecutive_rejects)
+                      s.max_consecutive_rejects, s.max_consecutive_losses, s.loss_streak_pause_min)
 
 
 async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = True) -> tuple[Engine, Any]:
@@ -101,7 +102,10 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
                       session_id=int(time.time()), journal=journal,
                       stops_level_points=s.stops_level_points,
                       freeze_level_points=s.freeze_level_points,
-                      server_sl_mult=s.server_sl_mult if s.mode is Mode.LIVE else 0.0)
+                      server_sl_mult=s.server_sl_mult if s.mode is Mode.LIVE else 0.0,
+                      risk_per_trade_pct=s.risk_per_trade_pct,
+                      money_per_point_1lot=s.money_per_point(1.0),
+                      volume_max=s.volume_max, max_lots=s.max_lots)
     if s.mode is Mode.LIVE:
         pos, avg = await asyncio.to_thread(gw.current_position)
         if pos:
@@ -113,11 +117,22 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         try:
             bars = await asyncio.to_thread(gw.recent_m1_bars, max(s.atr_baseline_bars, 50))
             strategy.f.seed_bars(bars)
-            log.info("ATR M1 pré-chargé sur %d bougies : %.0f points", len(bars),
-                     strategy.f.atr_points)
+            n_trend = max(s.trend_ema_slow + 100, s.trend_min_bars)
+            strategy.f.trend.m15.seed(await asyncio.to_thread(gw.recent_bars, "M15", n_trend))
+            strategy.f.trend.h1.seed(await asyncio.to_thread(gw.recent_bars, "H1", n_trend))
+            tv = strategy.f.trend.view()
+            log.info("pré-chargé : ATR M1 %.0f pts (%d bougies) · H1 %s · M15 %s · ADX M15 %.0f",
+                     strategy.f.atr_points, len(bars), "↑↓—"[(1 - tv.h1_dir) if tv.h1_dir else 2],
+                     "↑↓—"[(1 - tv.m15_dir) if tv.m15_dir else 2], tv.adx_m15)
         except Exception:
-            log.warning("historique M1 indisponible : ATR reconstruit en direct (~%d min)",
-                        s.atr_period)
+            log.warning("historique MT5 indisponible : indicateurs reconstruits en direct "
+                        "(ATR ~%d min, tendance H1 ~%d h)", s.atr_period, s.trend_min_bars)
+    if synthetic and s.trend_filter:
+        strategy.f.trend.enabled = False
+        log.info("flux synthétique : filtre de tendance H1/M15 désactivé (pas d'historique)")
+    if s.risk_per_trade_pct > 0:
+        log.info("taille des lots : %.2f %% du capital par trade (max %.2f lots)",
+                 s.risk_per_trade_pct, s.max_lots)
     if use_model:
         # Même mémoire d'IA en DRY_RUN et en LIVE : elle apprend du marché, pas de nos ordres.
         strategy.attach_model_file(s.resolved_model_file())
