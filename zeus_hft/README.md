@@ -97,6 +97,46 @@ Options utiles : `--symbol`, `--lot`, `--max-dd`, `--max-inventory`, `--no-model
 Tous les réglages : [`config/settings.py`](config/settings.py), surchargeables par
 variables `ZEUS_HFT_*` (voir `.env.example`).
 
+## 💱 Version 2.5 : market making crypto (MEXC Futures)
+
+**Pourquoi MEXC**
+- Frais maker **0 %** (spot et une centaine de perpétuels, sans niveau VIP). Binance Futures en compte standard : **0,02 %**, soit plus que le spread capté → perdant d'office.
+- API d'ordres futures rouverte le 18/04/2026, ordres **post-only** (`type=2`).
+
+**Comment le bot cote**
+- Prix juste = microprice + flux d'ordres agressifs.
+- Bid/ask **au meilleur prix** ; décalage selon l'**inventaire** (long → il baisse ses prix pour revendre).
+- Demi-spread élargi avec la **volatilité**.
+- On ne bouge un ordre qu'à **≥ 2 ticks** d'écart : chaque annulation coûte la place dans la file.
+- **Retrait automatique** :
+  - flux toxique (acheteurs/vendeurs agressifs > 65 %) ;
+  - balayage de 3 niveaux ou plus ;
+  - **markout moyen < −3 bps** (on se fait « sniper ») ;
+  - inventaire au plafond ;
+  - carnet désynchronisé ou flux coupé.
+
+**Backtest réaliste**
+- **File d'attente simulée** : on est exécuté seulement une fois la file devant nous consommée ;
+- latence 30 ms + gigue 20 ms ;
+- course entre annulation et exécution ;
+- rejet post-only ;
+- exécution forcée quand le carnet traverse notre prix.
+
+**Commandes**
+```bash
+ZeusHFT.exe mm-scan                                   # meilleures paires : 0 % maker, spread >= 2 ticks, volume
+ZeusHFT.exe probe                                     # latence réseau : P50 / P99 / P99.9 / gigue
+ZeusHFT.exe mm-run --symbol SOL_USDT                  # DRY_RUN : vrai flux, ordres simulés, tout est enregistré
+ZeusHFT.exe mm-backtest --file "data/mm/SOL_USDT_*.jsonl.gz"   # rejoue TA session enregistrée
+ZeusHFT.exe mm-run --symbol SOL_USDT --mode LIVE --confirm-live --size 1   # réel, 1 contrat
+```
+- Clés : `ZEUS_MM_API_KEY` / `ZEUS_MM_API_SECRET` dans `.env`. Droits **trading uniquement**, jamais retrait. Restreins la clé à l'IP du VPS.
+- Mode de position MEXC : hedge (par défaut) géré ; chaque ordre ouvre OU ferme, jamais les deux.
+
+**À savoir**
+- Adaptateur écrit d'après la documentation officielle MEXC et testé contre un faux exchange : **valide-le en DRY_RUN, puis en LIVE avec 1 contrat**.
+- Le KPI n°1 est le **markout**, pas le PnL : s'il est négatif, le spread ne compense pas la sélection adverse.
+
 ## 🧱 Version 2.4 : architecture HFT en 7 couches, adaptée à MT5
 
 Le bot suit le pipeline classique d'un bot HFT (*Market Data → Order Book → Strategy → Order
@@ -343,6 +383,7 @@ zeus_hft/
 ├── backtest/walkforward.py, montecarlo.py   # validation quantitative
 ├── ops/alerts.py, metrics.py   # Telegram, Prometheus
 ├── ops/recorder.py, hotconfig.py   # ticks bruts .csv.gz, réglages à chaud
+├── mm/                         # market making crypto : cotation, file d'attente, MEXC, scanner
 ├── strategies/features.py      # bougies M1, ATR, micro-range, vitesse, VWAP, sessions, news
 ├── strategies/momentum_breakout.py  # stratégie 1 : momentum / cassure
 ├── strategies/mean_reversion.py     # stratégie 2 : micro mean-reversion

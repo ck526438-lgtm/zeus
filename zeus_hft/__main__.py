@@ -159,6 +159,92 @@ def cmd_verify(a: argparse.Namespace) -> int:
     return 3
 
 
+def _mm_settings(a: argparse.Namespace):  # type: ignore[no-untyped-def]
+    from zeus_hft.mm.config import MMMode, MMSettings
+
+    over: dict[str, Any] = {}
+    for k in ("symbol", "quote_size", "max_inventory", "max_daily_loss", "tick", "contract_size",
+              "maker_fee"):
+        v = getattr(a, k, None)
+        if v is not None:
+            over[k] = v
+    if getattr(a, "mode", None):
+        over["mode"] = MMMode(a.mode)
+    if getattr(a, "confirm_live", False):
+        over["confirm_live"] = True
+    base = MMSettings()
+    return base.model_copy(update=over) if over else base
+
+
+def cmd_mm_run(a: argparse.Namespace) -> int:
+    from zeus_hft.app.factory import run_async
+    from zeus_hft.mm.runner import run_mm
+
+    s = _mm_settings(a)
+    setup_logging("INFO", s.log_file)
+    try:
+        run_async(run_mm(s))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        shutdown_logging()
+    return 0
+
+
+def cmd_mm_backtest(a: argparse.Namespace) -> int:
+    import glob
+
+    from zeus_hft.app.factory import run_async
+    from zeus_hft.mm.backtest import load_events, run_mm_backtest, synthetic_events
+
+    s = _mm_settings(a)
+    setup_logging("WARNING", None)
+    if a.file:
+        files = sorted(glob.glob(a.file))
+        if not files:
+            print(f"aucun fichier : {a.file}")
+            return 1
+
+        def events():  # type: ignore[no-untyped-def]
+            for f in files:
+                yield from load_events(f)
+        evs = events()
+    else:
+        evs = synthetic_events(int(a.synthetic or 3600), informed=a.informed, seed=a.seed)
+    rep = run_async(run_mm_backtest(s, evs))
+    shutdown_logging()
+    print(rep.text())
+    return 0
+
+
+def cmd_mm_scan(a: argparse.Namespace) -> int:
+    from zeus_hft.mm.mexc import MexcRest
+    from zeus_hft.mm.runner import scan_pairs
+
+    rows = scan_pairs(MexcRest(_mm_settings(a)), min_turnover=a.min_turnover, top=a.top)
+    if not rows:
+        print("aucune paire ne remplit les critères (0 % maker, spread >= 2 ticks, volume)")
+        return 1
+    print(f"{'paire':<16}{'spread':>8}{'bps':>8}{'volume 24h':>16}{'score':>8}")
+    for r in rows:
+        print(f"{r['symbol']:<16}{r['spread_ticks']:>6} t{r['spread_bps']:>8.2f}"
+              f"{r['turnover_24h']:>16,.0f}{r['score']:>8.1f}")
+    return 0
+
+
+def cmd_probe(a: argparse.Namespace) -> int:
+    from zeus_hft.mm.runner import probe_latency
+
+    hosts = a.hosts or ["contract.mexc.com", "api.mexc.com", "fapi.binance.com", "api.bybit.com"]
+    for r in probe_latency(hosts, n=a.n):
+        if not r["ok"]:
+            print(f"• {r['host']:<22} injoignable")
+            continue
+        print(f"• {r['host']:<22} P50 {r['p50']:6.1f} ms · P99 {r['p99']:6.1f} · P99.9 {r['p999']:6.1f}"
+              f" · gigue {r['jitter']:5.1f} ms ({r['ok']} mesures)")
+    return 0
+
+
 def cmd_montecarlo(a: argparse.Namespace) -> int:
     from zeus_hft.backtest.montecarlo import load_journal_pnls, monte_carlo
 
@@ -250,6 +336,39 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--equity", type=float, default=10_000.0)
     m.add_argument("--ruin-pct", type=float, default=20.0)
     m.set_defaults(fn=cmd_montecarlo)
+
+    def mm_common(sp: argparse.ArgumentParser) -> None:
+        sp.add_argument("--symbol", help="contrat MEXC, ex. SOL_USDT")
+        sp.add_argument("--size", dest="quote_size", type=float, help="contrats par ordre")
+        sp.add_argument("--max-inventory", dest="max_inventory", type=float)
+        sp.add_argument("--max-loss", dest="max_daily_loss", type=float, help="USDT par jour")
+
+    mr = sub.add_parser("mm-run", help="market making crypto MEXC (DRY_RUN ou LIVE)")
+    mm_common(mr)
+    mr.add_argument("--mode", choices=["DRY_RUN", "LIVE"], default="DRY_RUN")
+    mr.add_argument("--confirm-live", action="store_true")
+    mr.set_defaults(fn=cmd_mm_run)
+
+    mb = sub.add_parser("mm-backtest", help="backtest market making (file d'attente simulée)")
+    mm_common(mb)
+    mb.add_argument("--file", help="événements enregistrés, ex. 'data/mm/SOL_USDT_*.jsonl.gz'")
+    mb.add_argument("--synthetic", type=int, metavar="SECONDES")
+    mb.add_argument("--informed", type=float, default=0.2, help="part de flux informé (synthétique)")
+    mb.add_argument("--seed", type=int, default=3)
+    mb.add_argument("--tick", type=float)
+    mb.add_argument("--contract-size", dest="contract_size", type=float)
+    mb.add_argument("--maker-fee", dest="maker_fee", type=float)
+    mb.set_defaults(fn=cmd_mm_backtest)
+
+    ms = sub.add_parser("mm-scan", help="classe les paires MEXC pour le market making")
+    ms.add_argument("--min-turnover", type=float, default=5e6)
+    ms.add_argument("--top", type=int, default=15)
+    ms.set_defaults(fn=cmd_mm_scan)
+
+    pr = sub.add_parser("probe", help="latence réseau vers les exchanges (P50/P99/P99.9/gigue)")
+    pr.add_argument("hosts", nargs="*")
+    pr.add_argument("-n", type=int, default=50)
+    pr.set_defaults(fn=cmd_probe)
 
     v = sub.add_parser("verify-journal", help="vérifie que le journal des trades n'a pas été modifié")
     v.add_argument("--trades", default="data/zeus_hft_trades.csv")

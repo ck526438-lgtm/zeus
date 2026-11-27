@@ -65,6 +65,12 @@ class LatencyStats:
     p99_us: float
     max_us: float
     mean_us: float
+    p999_us: float = 0.0
+
+    @property
+    def jitter_us(self) -> float:
+        """Gigue = P99 − P50 : la stabilité compte autant que la moyenne."""
+        return self.p99_us - self.p50_us
 
 
 class LatencyTracker:
@@ -90,16 +96,16 @@ class LatencyTracker:
         if len(self._buf) == 0:
             return None
         a = self._buf.to_array().astype(np.float64) / 1e3
-        p50, p90, p99 = np.percentile(a, [50, 90, 99])
+        p50, p90, p99, p999 = np.percentile(a, [50, 90, 99, 99.9])
         return LatencyStats(len(a), float(p50), float(p90), float(p99), float(a.max()),
-                            float(a.mean()))
+                            float(a.mean()), float(p999))
 
     def summary(self) -> str:
         s = self.stats()
         if s is None:
             return f"{self.name}: n/a"
-        return (f"{self.name}: p50={s.p50_us:.1f}µs p90={s.p90_us:.1f}µs "
-                f"p99={s.p99_us:.1f}µs max={s.max_us:.1f}µs (n={s.count})")
+        return (f"{self.name}: p50={s.p50_us:.1f}µs p99={s.p99_us:.1f}µs "
+                f"p99.9={s.p999_us:.1f}µs gigue={s.jitter_us:.1f}µs (n={s.count})")
 
 
 class MetricsBus:
