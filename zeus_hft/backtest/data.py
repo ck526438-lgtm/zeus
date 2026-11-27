@@ -27,7 +27,10 @@ def _parse_time_ms(row: dict[str, str]) -> int:
 def load_ticks_csv(path: str | Path, symbol: str) -> Iterator[MarketUpdate]:
     """CSV avec au minimum : time_msc (ou time), bid, ask. Colonnes optionnelles :
     bid_qty, ask_qty, last, volume. Les lignes sans bid/ask valides sont ignorées."""
-    with open(path, newline="", encoding="utf-8") as f:
+    import gzip
+
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", newline="", encoding="utf-8") as f:  # type: ignore[operator]
         reader = csv.DictReader(f)
         for row in reader:
             try:

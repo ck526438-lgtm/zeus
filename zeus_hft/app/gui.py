@@ -20,6 +20,8 @@ from tkinter import messagebox, ttk
 from typing import Any
 
 from zeus_hft import __version__
+from pydantic import SecretStr
+
 from zeus_hft.config.settings import Mode, Settings
 from zeus_hft.core.telemetry import setup_logging
 
@@ -153,6 +155,8 @@ class App(tk.Tk):
         self.use_model = tk.BooleanVar(value=saved.get("use_model", True))
         self.confirm_live = tk.BooleanVar(value=False)          # jamais mémorisé, par sécurité
         self.autostart = tk.BooleanVar(value=saved.get("autostart", False))
+        self.tg_token = tk.StringVar(value=saved.get("tg_token", ""))
+        self.tg_chat = tk.StringVar(value=saved.get("tg_chat", ""))
         for label, w in (
             ("Mode", ttk.Combobox(cfg, textvariable=self.mode, values=["DRY_RUN", "LIVE"],
                                   width=9, state="readonly")),
@@ -181,7 +185,11 @@ class App(tk.Tk):
         ttk.Checkbutton(cfg3, text="Démarrage automatique (à l'ouverture + relance si MT5 se coupe)",
                         variable=self.autostart, command=self._save_config).pack(side="left", padx=(0, 12))
         self.b_boot = ttk.Button(cfg3, text="", command=self._toggle_windows_startup)
-        self.b_boot.pack(side="left")
+        self.b_boot.pack(side="left", padx=(0, 16))
+        ttk.Label(cfg3, text="Alertes Telegram : jeton").pack(side="left", padx=(0, 4))
+        ttk.Entry(cfg3, textvariable=self.tg_token, width=18, show="•").pack(side="left", padx=(0, 6))
+        ttk.Label(cfg3, text="chat id").pack(side="left", padx=(0, 4))
+        ttk.Entry(cfg3, textvariable=self.tg_chat, width=12).pack(side="left")
         self._update_boot_button()
 
         btns = ttk.Frame(self)
@@ -246,7 +254,8 @@ class App(tk.Tk):
                 "riskpct": self.riskpct.get(), "trend": self.trend.get(),
                 "strategy": self.strategy.get(), "news": self.news.get(),
                 "synthetic": self.synthetic.get(), "use_model": self.use_model.get(),
-                "autostart": self.autostart.get()}
+                "autostart": self.autostart.get(),
+                "tg_token": self.tg_token.get().strip(), "tg_chat": self.tg_chat.get().strip()}
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -287,6 +296,8 @@ class App(tk.Tk):
             "trend_filter": self.trend.get(),
             "news_times_utc": self.news.get().strip(),
             "confirm_live": self.confirm_live.get(),
+            **({"telegram_token": SecretStr(self.tg_token.get().strip()),
+                "telegram_chat": self.tg_chat.get().strip()} if self.tg_token.get().strip() else {}),
         })
 
     def _start(self, auto: bool = False) -> None:

@@ -121,6 +121,7 @@ class OrderManager:
         self.fill_count = 0
         self.order_count = 0
         self.tick_to_order = LatencyTracker("tick->ordre")
+        self.ack_latency = LatencyTracker("envoi->ACK")
         gateway.set_event_sink(self.on_event)
 
     # ------------------------------------------------------------------ #
@@ -174,9 +175,14 @@ class OrderManager:
         if (self.position == 0.0 and target != 0.0 and self.risk_pct > 0
                 and decision.stop_points and not self.orders):
             # Ouverture : taille calculée pour risquer risk_pct % du capital sur ce stop
+            cap = self.max_lots
+            notional_lot = (top.bid + top.ask) * 0.5 * self.contract_size
+            if self.risk.limits.max_notional > 0 and notional_lot > 0:
+                # la taille respecte aussi le plafond d'exposition (levier max)
+                cap = min(cap, self.risk.limits.max_notional / notional_lot)
             lots = lots_for_risk(self.risk.equity, self.risk_pct, decision.stop_points,
                                  self.money_per_point, self.volume_min, self.volume_step,
-                                 self.volume_max, self.max_lots)
+                                 self.volume_max, cap)
             if lots <= 0.0:
                 self.last_skip = (f"lot minimum trop risqué pour {self.risk_pct:g} % "
                                   f"(stop {decision.stop_points:.0f} pts)")
@@ -306,8 +312,9 @@ class OrderManager:
                    t0_ns: int, data_age_ms: float, reducing: bool = False,
                    top: BookTop | None = None, spread_pts: float = 0.0) -> int:
         signed = qty * int(side)
+        mark = (top.bid + top.ask) * 0.5 if top is not None else 0.0
         verdict = self.risk.check_order(signed, self.position, self.working_signed, data_age_ms,
-                                        spread_pts)
+                                        spread_pts, mark * self.contract_size)
         if not verdict.allowed:
             log.debug("ordre refusé par le risque : %s %s", verdict.reason.value, verdict.detail)
             return 0
@@ -379,6 +386,8 @@ class OrderManager:
 
         if k is EventKind.ACK:
             self.risk.record_execution_ok()
+            if order.sent_ns and order.status is OrderStatus.PENDING_NEW:
+                self.ack_latency.record(max(self._clock() - order.sent_ns, 0))
             if order.status is OrderStatus.PENDING_NEW:
                 order.status = OrderStatus.WORKING
         elif k is EventKind.FILL:

@@ -106,6 +106,21 @@ class Settings(BaseSettings):
     runner_hold_mult: float = Field(5.0, ge=1, description="durée max × k après la clôture partielle")
     max_consecutive_losses: int = Field(4, ge=1)
     loss_streak_pause_min: float = Field(120.0, ge=0, description="0 = pause jusqu'au lendemain")
+    window_dd_pct: float = Field(1.5, ge=0, description="drawdown max (% equity) sur fenêtre glissante")
+    window_dd_minutes: float = Field(60.0, gt=0)
+    max_leverage: float = Field(20.0, ge=0, description="exposition notionnelle max = k × equity (0 = off)")
+    max_reject_rate: float = Field(0.3, gt=0, le=1, description="taux de rejets -> mode dégradé")
+    degraded_pause_min: float = Field(5.0, ge=0)
+
+    # --- Supervision / exploitation ---
+    telegram_token: SecretStr = Field(SecretStr(""), validation_alias=AliasChoices(
+        "ZEUS_TG_TOKEN", "ZEUS_HFT_TELEGRAM_TOKEN"))
+    telegram_chat: str = Field("", validation_alias=AliasChoices("ZEUS_TG_CHAT", "ZEUS_HFT_TELEGRAM_CHAT"))
+    metrics_port: int = Field(0, ge=0, le=65535, description="endpoint Prometheus /metrics (0 = off)")
+    record_ticks: bool = True
+    ticks_dir: str = "data/ticks"
+    state_file: str = "data/zeus_hft_state_{mode}_{symbol}.json"
+    hot_config_file: str = "data/zeus_hft_hot.json"
 
     # --- Stratégie 1 : scalping momentum / cassure ---
     range_window_s: float = Field(60.0, gt=1)
@@ -150,6 +165,7 @@ class Settings(BaseSettings):
     commission_per_lot: float = Field(7.0, ge=0, description="aller-retour / 2 par exécution")
     sim_latency_ms: float = Field(40.0, ge=0)
     sim_slippage_points: float = Field(2.0, ge=0)
+    sim_latency_jitter_ms: float = Field(10.0, ge=0, description="gigue aléatoire ajoutée à la latence")
 
     # --- Spécifications par défaut du symbole (écrasées par MT5 en DRY_RUN/LIVE) ---
     point: float = 0.01
@@ -197,6 +213,9 @@ class Settings(BaseSettings):
     def money_per_point(self, lots: float = 1.0) -> float:
         """Gain/perte (devise du compte) pour un mouvement d'un point, à ``lots`` lots."""
         return self.tick_value * self.point / self.tick_size * lots
+
+    def resolved_state_file(self) -> str:
+        return self.state_file.format(symbol=self.symbol, mode=self.mode.value)
 
     def resolved_model_file(self) -> str:
         return self.model_file.format(symbol=self.symbol, mode=self.mode.value)

@@ -32,7 +32,7 @@ def _settings(a: argparse.Namespace, mode: Mode | None = None) -> Settings:
     if mode is not None:
         over["mode"] = mode
     for k in ("symbol", "order_qty", "max_daily_drawdown", "max_net_inventory", "strategy",
-              "news_times_utc", "max_spread_points"):
+              "news_times_utc", "max_spread_points", "metrics_port"):
         v = getattr(a, k, None)
         if v is not None:
             over[k] = v
@@ -148,6 +148,17 @@ def cmd_walkforward(a: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_verify(a: argparse.Namespace) -> int:
+    from zeus_hft.execution.journal import verify_journal
+
+    ok, n, bad = verify_journal(a.trades)
+    if ok:
+        print(f"✓ journal intègre : {n} trades, chaîne de hachage valide")
+        return 0
+    print(f"✗ journal ALTÉRÉ ou ancien format : 1re ligne invalide n°{bad} (sur {n} lues)")
+    return 3
+
+
 def cmd_montecarlo(a: argparse.Namespace) -> int:
     from zeus_hft.backtest.montecarlo import load_journal_pnls, monte_carlo
 
@@ -192,6 +203,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--news", dest="news_times_utc",
                         help="heures de news UTC : '13:30' (chaque jour) ou '2026-12-04 13:30'")
         sp.add_argument("--max-spread", dest="max_spread_points", type=float)
+        sp.add_argument("--metrics-port", dest="metrics_port", type=int,
+                        help="expose /metrics pour Prometheus sur ce port")
 
     r = sub.add_parser("run", help="temps réel (DRY_RUN ou LIVE)")
     common(r)
@@ -237,6 +250,10 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--equity", type=float, default=10_000.0)
     m.add_argument("--ruin-pct", type=float, default=20.0)
     m.set_defaults(fn=cmd_montecarlo)
+
+    v = sub.add_parser("verify-journal", help="vérifie que le journal des trades n'a pas été modifié")
+    v.add_argument("--trades", default="data/zeus_hft_trades.csv")
+    v.set_defaults(fn=cmd_verify)
     b.add_argument("--json", action="store_true")
     b.set_defaults(fn=cmd_backtest)
 

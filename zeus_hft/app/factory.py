@@ -44,14 +44,18 @@ def run_async(coro: Awaitable[T]) -> T:
         return asyncio.run(coro)  # type: ignore[arg-type]
 
 
-def _limits(s: Settings) -> RiskLimits:
+def _limits(s: Settings, equity: float | None = None) -> RiskLimits:
     # Une seule position, taille fixe : l'inventaire max est plafonné au lot (pas de grille,
     # pas de martingale, pas de renforcement contre la tendance).
     max_inv = s.max_lots if s.risk_per_trade_pct > 0 else min(s.max_net_inventory, s.order_qty)
     return RiskLimits(s.max_daily_drawdown, max_inv,
                       s.max_orders_per_second, s.max_latency_ms, s.latency_breaches_to_kill,
                       s.max_data_staleness_ms, s.max_spread_points, s.max_daily_loss_pct,
-                      s.max_consecutive_rejects, s.max_consecutive_losses, s.loss_streak_pause_min)
+                      s.max_consecutive_rejects, s.max_consecutive_losses, s.loss_streak_pause_min,
+                      max_notional=(equity or s.starting_equity) * s.max_leverage,
+                      window_dd=(equity or s.starting_equity) * s.window_dd_pct / 100.0,
+                      window_dd_minutes=s.window_dd_minutes, max_reject_rate=s.max_reject_rate,
+                      degraded_pause_min=s.degraded_pause_min)
 
 
 async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = True) -> tuple[Engine, Any]:
@@ -82,7 +86,27 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         else:
             equity = s.starting_equity
 
-    risk = RiskManager(_limits(s), equity, on_kill=lambda r: log.critical("KILL-SWITCH : %s", r))
+    from zeus_hft.ops.alerts import Alerter
+
+    alerter = Alerter(s.telegram_token.get_secret_value(), s.telegram_chat,
+                      prefix=f"Zeus HFT {s.symbol} ({s.mode.value})")
+    risk = RiskManager(
+        _limits(s, equity), equity,
+        on_kill=lambda r: alerter.alert("crit", "kill", f"KILL-SWITCH : {r}", force=True),
+        on_halt=lambda k, r: alerter.alert("warn", f"halt-{k}", f"pause : {r}"))
+    # reprise après crash : arrêt journalier, série de pertes et pauses de la même journée
+    import json
+    from pathlib import Path
+    state_path = Path(s.resolved_state_file())
+    if state_path.exists():
+        try:
+            restored = risk.load_state(json.loads(state_path.read_text(encoding="utf-8"))["risk"])
+            if restored:
+                log.warning("état restauré après redémarrage : %s", " · ".join(restored))
+        except (OSError, ValueError, KeyError) as exc:
+            log.warning("état précédent illisible (%s) : on repart à neuf", exc)
+    if alerter.enabled:
+        log.info("alertes Telegram actives")
     if s.mode is Mode.LIVE:
         execution: Any = gw
         gw.latency_cb = lambda ms: loop.call_soon_threadsafe(risk.record_latency, ms)
@@ -91,7 +115,8 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         sim = SimExchange(point=s.point, contract_size=s.contract_size, latency_ms=s.sim_latency_ms,
                           slippage_points=s.sim_slippage_points, maker_fee_bps=s.maker_fee_bps,
                           taker_fee_bps=s.taker_fee_bps,
-                          commission_per_lot=s.commission_per_lot / 2)
+                          commission_per_lot=s.commission_per_lot / 2,
+                          latency_jitter_ms=s.sim_latency_jitter_ms)
         execution = sim
     # Le journal sépare DRY_RUN et LIVE : seuls de vrais ordres (démo ou réel) comptent
     # pour juger la rentabilité en mode LIVE.
@@ -148,8 +173,25 @@ async def build_engine(s: Settings, synthetic: bool = False, use_model: bool = T
         reconcile=gw.reconcile if (gw is not None and s.mode is Mode.LIVE) else None,
         starting_equity=equity,
         position_snapshot=gw.position_snapshot if (gw is not None and s.mode is Mode.LIVE) else None,
+        alerter=alerter,
+        recorder=_recorder(s),
     )
+    if s.metrics_port:
+        from zeus_hft.ops.metrics import MetricsServer
+        try:
+            engine.metrics_server = MetricsServer(s.metrics_port, engine.snapshot, s.symbol)
+            log.info("métriques Prometheus : http://127.0.0.1:%d/metrics", s.metrics_port)
+        except OSError as exc:
+            log.error("port de métriques %d indisponible : %s", s.metrics_port, exc)
     hedge = " · hedging" if getattr(gw, "hedging", False) else ""
     engine.account_label = f"{account}{hedge} · {s.mode.value} · stratégie {s.strategy}"
     log.info("prêt : %s, %s", engine.account_label, journal.stats().verdict)
     return engine, gw
+
+
+def _recorder(s: Settings):  # type: ignore[no-untyped-def]
+    if not s.record_ticks:
+        return None
+    from zeus_hft.ops.recorder import TickRecorder
+    log.info("enregistrement des ticks : %s/%s_AAAAMMJJ.csv.gz", s.ticks_dir, s.symbol)
+    return TickRecorder(s.ticks_dir, s.symbol)

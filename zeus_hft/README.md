@@ -97,6 +97,55 @@ Options utiles : `--symbol`, `--lot`, `--max-dd`, `--max-inventory`, `--no-model
 Tous les réglages : [`config/settings.py`](config/settings.py), surchargeables par
 variables `ZEUS_HFT_*` (voir `.env.example`).
 
+## 🧱 Version 2.4 : architecture HFT en 7 couches, adaptée à MT5
+
+Le bot suit le pipeline classique d'un bot HFT (*Market Data → Order Book → Strategy → Order
+Manager → Risk*). Voici, couche par couche, ce qui est en place et ce qui **ne peut pas** l'être
+avec MetaTrader 5 en compte particulier.
+
+| Couche | Dans Zeus HFT |
+|---|---|
+| 1. Infrastructure | VPS Windows proche du broker conseillé. Co-location, kernel bypass et FPGA : impossibles via un broker MT5 |
+| 2. Feed handler | thread dédié 2 ms, reconnexion avec backoff, heartbeat, **chaque tick enregistré** (`data/ticks/*.csv.gz`, rejouable) |
+| 3. Book builder | carnet L2 trié O(log n), détection de trous de séquence, OBI, microprice, spread pré-calculés |
+| 4. Exécution | `client_order_id` déterministes (idempotence), états NEW→ACK→PARTIAL→FILLED/CANCELED/REJECTED, cancel/replace natif, **mode dégradé** si > 30 % de rejets |
+| 5. Décision | momentum, mean-reversion, OBI + IA ; paramètres modifiables **à chaud** ; walk-forward |
+| 6. Risque | contrôles **avant chaque ordre** : position, perte du jour, ordres/s, **notionnel (levier max)**, **drawdown sur fenêtre glissante**, kill-switch, **heartbeat → annulation de tous les ordres**, réduction seule automatique, **état sauvegardé toutes les 5 s** |
+| 7. Supervision | **alertes Telegram**, **métriques Prometheus/Grafana**, latence par étape (tick→décision→envoi→ACK), **journal infalsifiable** (chaîne SHA-256) |
+
+### Nouveautés v2.4
+- **Reprise après crash** : l'état du risque (début de journée, arrêt journalier, série de pertes,
+  pauses) est sauvegardé toutes les 5 s. Un redémarrage **ne lève pas** un arrêt pour perte du jour.
+- **Heartbeat de données** : si le flux se coupe, tous les ordres en attente sont annulés et le bot passe en
+  réduction seule. Les positions restent protégées par leur SL serveur.
+- **Limite notionnelle** : exposition ≤ 20 × equity. Le calcul des lots en tient compte.
+- **Drawdown glissant** : 1,5 % de l'equity en moins de 60 min → réduction seule pendant 1 h.
+- **Mode dégradé** : plus de 30 % d'ordres rejetés sur 60 s → réduction seule pendant 5 min.
+- **Alertes Telegram** (jeton et chat id dans l'appli, ou `ZEUS_TG_TOKEN` / `ZEUS_TG_CHAT`) :
+  démarrage et arrêt, kill-switch, pauses, MT5 déconnecté, latence anormale, flux rétabli, bilan quotidien.
+  L'envoi se fait dans un thread séparé et ne bloque jamais le trading.
+- **Prometheus** : `ZeusHFT.exe run --metrics-port 9108`, puis `http://127.0.0.1:9108/metrics`.
+- **Configuration à chaud** : crée ou édite `data/zeus_hft_hot.json`. Le bot l'applique en 5 s, sans redémarrage :
+  ```json
+  {"trading_enabled": false}
+  {"max_spread_points": 30, "risk_per_trade_pct": 0.25, "velocity_entry_atr": 0.5}
+  ```
+- **Journal infalsifiable** : chaque trade contient l'empreinte de la ligne précédente ;
+  `ZeusHFT.exe verify-journal` détecte toute ligne modifiée ou supprimée.
+- **Backtest** : latence fixe + **gigue aléatoire** (10 ms), et rejeu direct des ticks enregistrés :
+  `ZeusHFT.exe backtest --csv data/ticks/XAUUSD_20261127.csv.gz`.
+
+### Pourquoi pas de C++, de FIX ou de co-location ?
+- **Le goulot est le réseau, pas le code.** Une décision prend environ 40 µs en Python ; un ordre MT5 met
+  20 à 150 ms pour atteindre le broker, soit environ 1 000 fois plus. Réécrire le moteur en C++ ne
+  changerait pas le résultat.
+- **MT5 n'offre ni FIX, ni ITCH/OUCH, ni co-location.** La seule voie plus rapide côté MT5 est un EA
+  MQL5 exécuté dans le terminal, qui gagne moins d'une milliseconde.
+- **Le market making n'est pas possible sur un CFD MT5.** Le broker fixe les prix : un ordre limite ne
+  s'exécute que si son prix est traversé. Tu ne captures donc pas le spread, tu le paies.
+- Tes documents disent la même chose : *« commence par du HFT léger (secondes) sur crypto ou CFD »* et
+  *« la plupart des bots meurent de frais et de slippage mal modélisés, pas de manque de vitesse »*.
+
 ## 🏛️ Version 2.3 : filtres, gestion du capital, validation
 
 ### 1. Multi-filtres : la plupart des ticks sont ignorés
@@ -292,6 +341,8 @@ zeus_hft/
 ├── strategies/news_file.py     # calendrier exporté par mql5/ZeusNewsExporter.mq5
 ├── execution/sizing.py         # lots selon le % de risque et la valeur du tick
 ├── backtest/walkforward.py, montecarlo.py   # validation quantitative
+├── ops/alerts.py, metrics.py   # Telegram, Prometheus
+├── ops/recorder.py, hotconfig.py   # ticks bruts .csv.gz, réglages à chaud
 ├── strategies/features.py      # bougies M1, ATR, micro-range, vitesse, VWAP, sessions, news
 ├── strategies/momentum_breakout.py  # stratégie 1 : momentum / cassure
 ├── strategies/mean_reversion.py     # stratégie 2 : micro mean-reversion

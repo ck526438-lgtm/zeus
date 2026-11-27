@@ -93,10 +93,11 @@ async def run_backtest(s: Settings, updates: Iterable[MarketUpdate], *, use_mode
     sim = SimExchange(point=s.point, contract_size=s.contract_size, latency_ms=s.sim_latency_ms,
                       slippage_points=s.sim_slippage_points, maker_fee_bps=s.maker_fee_bps,
                       taker_fee_bps=s.taker_fee_bps, commission_per_lot=s.commission_per_lot / 2,
-                      touch_fill=touch_fill, clock_ns=clock)
+                      touch_fill=touch_fill, clock_ns=clock,
+                      latency_jitter_ms=s.sim_latency_jitter_ms)
     from zeus_hft.app.factory import _limits
     from zeus_hft.execution.journal import TradeJournal
-    limits = _limits(s)
+    limits = _limits(s, s.starting_equity)
     journal = TradeJournal(None, "BACKTEST", s.symbol, min_trades=s.verdict_min_trades)
     risk = RiskManager(limits, s.starting_equity, clock_ns=clock, wall_clock_s=lambda: clock.now / 1e9)
     om = OrderManager(s.symbol, sim, risk, point=s.point, volume_step=s.volume_step,
