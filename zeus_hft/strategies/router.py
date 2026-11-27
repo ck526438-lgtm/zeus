@@ -43,6 +43,7 @@ class StrategyRouter(Strategy):
         self.enabled: list[Any] = {"auto": [self.mom, self.mr], "momentum": [self.mom],
                                    "meanrev": [self.mr], "obi": []}[self.mode]
         self.owner: Any = None
+        self._pending_sl: float | None = None
         self._was_open = False
         self._cool_until = 0
         self._offset_done = not realtime
@@ -92,6 +93,11 @@ class StrategyRouter(Strategy):
             owner = self.owner or self.enabled[0]
             self.owner = owner
             dec = owner.evaluate(self.f, top, position, avg_price, now_ns)
+            ex = getattr(owner, "exit", None)
+            if ex is not None:
+                new_sl = ex.take_changed_stop()
+                if new_sl is not None:
+                    self._pending_sl = new_sl
             if dec is not None:
                 self.last_reason = f"{owner.name}: {dec.reason}"
             return dec
@@ -104,6 +110,10 @@ class StrategyRouter(Strategy):
             self.owner = None
         if now_ns < self._cool_until:
             return self._flat("pause après sortie")
+        f = self.f
+        if f.spread_avg > 0 and f.spread_pts > self.s.spread_avg_mult * f.spread_avg:
+            return self._flat(f"spread {f.spread_pts:.0f} > {self.s.spread_avg_mult:g}× moyenne "
+                              f"({f.spread_avg:.0f})")
 
         for st in self.enabled:
             dec = st.evaluate(self.f, top, 0.0, 0.0, now_ns)
@@ -123,6 +133,14 @@ class StrategyRouter(Strategy):
         self.owner = None
         return self._flat(f"attente ({self.f.regime.label})")
 
+    def pop_protective_sl(self) -> float | None:
+        """Stop resserré (break-even / trailing) à reporter côté serveur MT5."""
+        sl, self._pending_sl = self._pending_sl, None
+        return sl
+
+    def update_news(self, events: list[tuple[int, str]]) -> None:
+        self.f.news.set_file_events(events)
+
     def _flat(self, reason: str) -> Decision:
         self.last_reason = reason
         return Decision(0.0, Urgency.PASSIVE, None, reason, 0.0, None, "")
@@ -134,4 +152,8 @@ class StrategyRouter(Strategy):
         st["mode"] = self.mode
         st["reason"] = self.last_reason
         st["vetoes"] = self.vetoes
+        nxt = self.f.news.next_event(self.f.utc_ms) if self.f.utc_ms else None
+        if nxt is not None:
+            from zeus_hft.strategies.features import utc_minute_label
+            st["next_news"] = f"{utc_minute_label(nxt[0])} UTC {nxt[1][:28]}"
         return st

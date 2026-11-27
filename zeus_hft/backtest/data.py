@@ -27,7 +27,10 @@ def _parse_time_ms(row: dict[str, str]) -> int:
 def load_ticks_csv(path: str | Path, symbol: str) -> Iterator[MarketUpdate]:
     """CSV avec au minimum : time_msc (ou time), bid, ask. Colonnes optionnelles :
     bid_qty, ask_qty, last, volume. Les lignes sans bid/ask valides sont ignorées."""
-    with open(path, newline="", encoding="utf-8") as f:
+    import gzip
+
+    opener = gzip.open if str(path).endswith(".gz") else open
+    with opener(path, "rt", newline="", encoding="utf-8") as f:  # type: ignore[operator]
         reader = csv.DictReader(f)
         for row in reader:
             try:
@@ -66,6 +69,39 @@ def download_ticks_mt5(symbol: str, days: int, out: str | Path, mt5: object | No
             w.writerow(["time_msc", "bid", "ask", "last", "volume"])
             for t in ticks:
                 w.writerow([int(t["time_msc"]), t["bid"], t["ask"], t["last"], t["volume"]])
+        # bougies M15 / H1 (avec 30 jours d'avance) pour le filtre de tendance du backtest
+        for tf_name in ("M15", "H1"):
+            tf = getattr(m, f"TIMEFRAME_{tf_name}")
+            rates = m.copy_rates_range(symbol, tf, start - timedelta(days=30), end)  # type: ignore[attr-defined]
+            if rates is None:
+                continue
+            with open(bars_path(out, symbol, tf_name), "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["time_ms", "open", "high", "low", "close"])
+                for r in rates:
+                    w.writerow([int(r["time"]) * 1000, r["open"], r["high"], r["low"], r["close"]])
         return len(ticks)
     finally:
         m.shutdown()  # type: ignore[attr-defined]
+
+
+def bars_path(ticks_csv: str | Path, symbol: str, tf: str) -> Path:
+    return Path(ticks_csv).with_name(f"{symbol}_{tf}.csv")
+
+
+def load_bars_csv(path: str | Path) -> list[tuple[int, float, float, float, float]]:
+    """Bougies (time_ms d'ouverture, o, h, l, c) triées par date ; [] si le fichier n'existe pas.
+    Le simulateur n'utilise que celles clôturées avant le 1er tick (pas de biais du futur)."""
+    p = Path(path)
+    if not p.exists():
+        return []
+    out: list[tuple[int, float, float, float, float]] = []
+    with open(p, newline="", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            try:
+                out.append((int(float(r["time_ms"])), float(r["open"]), float(r["high"]),
+                            float(r["low"]), float(r["close"])))
+            except (KeyError, ValueError):
+                continue
+    out.sort()
+    return out

@@ -77,13 +77,50 @@ class Settings(BaseSettings):
     shock_velocity_atr: float = Field(2.0, gt=0, description="vitesse > k×ATR -> choc (news)")
     shock_pause_s: float = Field(120.0, ge=0)
     server_utc_offset_hours: float = Field(2.0, description="décalage heure serveur (backtest)")
-    momentum_sessions_utc: str = "07:00-11:00,13:30-17:00"
-    meanrev_sessions_utc: str = "19:30-21:30,00:30-06:00"
+    momentum_sessions_utc: str = "08:00-11:30,13:30-17:00"
+    meanrev_sessions_utc: str = "19:30-21:00,23:30-06:00"
+    blackout_sessions_utc: str = Field("21:00-23:00", description="rollover : spreads qui explosent")
     session_open_blackout_min: float = Field(5.0, ge=0)
-    session_opens_utc: str = "07:00,13:30"
+    session_opens_utc: str = "08:00,13:30"
     news_times_utc: str = Field("", description="'HH:MM' chaque jour ou 'AAAA-MM-JJ HH:MM', séparés par des virgules")
-    news_before_min: float = Field(5.0, ge=0)
+    news_before_min: float = Field(15.0, ge=0)
     news_after_min: float = Field(15.0, ge=0)
+    news_file: str = Field("auto", description="CSV exporté par ZeusNewsExporter.mq5 ('auto' = "
+                           "dossier Common\\Files de MT5, '' = désactivé)")
+
+    # --- Filtre de tendance supérieure (H1 / M15) ---
+    trend_filter: bool = True
+    trend_ema_fast: int = Field(50, ge=2)
+    trend_ema_slow: int = Field(200, ge=3)
+    adx_period: int = Field(14, ge=2)
+    trend_min_bars: int = Field(50, ge=2, description="bougies H1/M15 minimum avant de trader")
+    mr_max_adx: float = Field(22.0, gt=0, description="ADX M15 max pour la mean-reversion")
+    spread_avg_mult: float = Field(1.5, ge=1, description="spread > k × spread moyen -> pas d'entrée")
+
+    # --- Gestion du capital et des sorties ---
+    risk_per_trade_pct: float = Field(0.5, ge=0, le=5, description="0 = lot fixe (order_qty)")
+    max_lots: float = Field(1.0, gt=0, description="plafond de taille par trade")
+    breakeven_at_r: float = Field(1.0, ge=0, description="SL au prix d'entrée + frais à 1R (0 = off)")
+    partial_close_frac: float = Field(0.5, ge=0, lt=1, description="part encaissée au 1er objectif")
+    trail_atr: float = Field(1.0, gt=0, description="trailing du reliquat = k × ATR M1")
+    runner_hold_mult: float = Field(5.0, ge=1, description="durée max × k après la clôture partielle")
+    max_consecutive_losses: int = Field(4, ge=1)
+    loss_streak_pause_min: float = Field(120.0, ge=0, description="0 = pause jusqu'au lendemain")
+    window_dd_pct: float = Field(1.5, ge=0, description="drawdown max (% equity) sur fenêtre glissante")
+    window_dd_minutes: float = Field(60.0, gt=0)
+    max_leverage: float = Field(20.0, ge=0, description="exposition notionnelle max = k × equity (0 = off)")
+    max_reject_rate: float = Field(0.3, gt=0, le=1, description="taux de rejets -> mode dégradé")
+    degraded_pause_min: float = Field(5.0, ge=0)
+
+    # --- Supervision / exploitation ---
+    telegram_token: SecretStr = Field(SecretStr(""), validation_alias=AliasChoices(
+        "ZEUS_TG_TOKEN", "ZEUS_HFT_TELEGRAM_TOKEN"))
+    telegram_chat: str = Field("", validation_alias=AliasChoices("ZEUS_TG_CHAT", "ZEUS_HFT_TELEGRAM_CHAT"))
+    metrics_port: int = Field(0, ge=0, le=65535, description="endpoint Prometheus /metrics (0 = off)")
+    record_ticks: bool = True
+    ticks_dir: str = "data/ticks"
+    state_file: str = "data/zeus_hft_state_{mode}_{symbol}.json"
+    hot_config_file: str = "data/zeus_hft_hot.json"
 
     # --- Stratégie 1 : scalping momentum / cassure ---
     range_window_s: float = Field(60.0, gt=1)
@@ -128,12 +165,16 @@ class Settings(BaseSettings):
     commission_per_lot: float = Field(7.0, ge=0, description="aller-retour / 2 par exécution")
     sim_latency_ms: float = Field(40.0, ge=0)
     sim_slippage_points: float = Field(2.0, ge=0)
+    sim_latency_jitter_ms: float = Field(10.0, ge=0, description="gigue aléatoire ajoutée à la latence")
 
     # --- Spécifications par défaut du symbole (écrasées par MT5 en DRY_RUN/LIVE) ---
     point: float = 0.01
     contract_size: float = 100.0
     volume_step: float = 0.01
     volume_min: float = 0.01
+    volume_max: float = 100.0
+    tick_value: float = Field(1.0, gt=0, description="valeur d'un tick pour 1 lot (devise du compte)")
+    tick_size: float = Field(0.01, gt=0)
     stops_level_points: float = 0.0
     freeze_level_points: float = 0.0
 
@@ -154,9 +195,27 @@ class Settings(BaseSettings):
             raise ValueError("exit_threshold doit être < entry_threshold")
         if self.mr_exit_dev_atr >= self.mr_entry_dev_atr:
             raise ValueError("mr_exit_dev_atr doit être < mr_entry_dev_atr")
+        if self.trend_ema_fast >= self.trend_ema_slow:
+            raise ValueError("trend_ema_fast doit être < trend_ema_slow")
         if self.order_qty > self.max_net_inventory:
             raise ValueError("order_qty ne peut pas dépasser max_net_inventory")
         return self
+
+    def resolved_news_file(self) -> str:
+        if self.news_file != "auto":
+            return self.news_file
+        import os
+        appdata = os.environ.get("APPDATA")
+        if not appdata:
+            return ""
+        return os.path.join(appdata, "MetaQuotes", "Terminal", "Common", "Files", "zeus_news.csv")
+
+    def money_per_point(self, lots: float = 1.0) -> float:
+        """Gain/perte (devise du compte) pour un mouvement d'un point, à ``lots`` lots."""
+        return self.tick_value * self.point / self.tick_size * lots
+
+    def resolved_state_file(self) -> str:
+        return self.state_file.format(symbol=self.symbol, mode=self.mode.value)
 
     def resolved_model_file(self) -> str:
         return self.model_file.format(symbol=self.symbol, mode=self.mode.value)

@@ -46,7 +46,12 @@ class SimExchange:
         touch_fill: float = 0.0,
         max_fill_qty: float = 0.0,
         clock_ns: Callable[[], int] = time.perf_counter_ns,
+        latency_jitter_ms: float = 0.0,
+        seed: int = 42,
     ) -> None:
+        import random
+        self._rng = random.Random(seed)
+        self.jitter_ns = int(latency_jitter_ms * 1e6)
         self.point = point
         self.contract_size = contract_size
         self.latency_ns = int(latency_ms * 1e6)
@@ -73,14 +78,23 @@ class SimExchange:
             self._sink(ev)
 
     # --- Interface ExecutionGateway ------------------------------------ #
+    def _arrival(self) -> int:
+        """Latence fixe + gigue aléatoire ; l'ordre d'arrivée des actions est préservé (FIFO)."""
+        t = self._clock() + self.latency_ns
+        if self.jitter_ns:
+            t += int(self._rng.random() * self.jitter_ns)
+        if self._inbox and t < self._inbox[-1][0]:
+            t = self._inbox[-1][0]
+        return t
+
     async def submit(self, order: Order) -> None:
-        self._inbox.append((self._clock() + self.latency_ns, "new", order, 0.0, 0.0))
+        self._inbox.append((self._arrival(), "new", order, 0.0, 0.0))
 
     async def cancel(self, order: Order) -> None:
-        self._inbox.append((self._clock() + self.latency_ns, "cancel", order, 0.0, 0.0))
+        self._inbox.append((self._arrival(), "cancel", order, 0.0, 0.0))
 
     async def replace(self, order: Order, new_price: float, new_qty: float) -> None:
-        self._inbox.append((self._clock() + self.latency_ns, "replace", order, new_price, new_qty))
+        self._inbox.append((self._arrival(), "replace", order, new_price, new_qty))
 
     # --- Moteur ---------------------------------------------------------- #
     def _fee(self, qty: float, price: float, maker: bool) -> float:

@@ -22,6 +22,7 @@ from typing import Callable
 from zeus_hft.core.orderbook import BookTop
 from zeus_hft.core.telemetry import LatencyTracker
 from zeus_hft.execution.journal import TradeJournal
+from zeus_hft.execution.sizing import lots_for_risk
 from zeus_hft.core.types import (
     Decision,
     EventKind,
@@ -71,7 +72,22 @@ class OrderManager:
         stops_level_points: float = 0.0,
         freeze_level_points: float = 0.0,
         server_sl_mult: float = 0.0,
+        risk_per_trade_pct: float = 0.0,
+        money_per_point_1lot: float = 0.0,
+        volume_max: float = 100.0,
+        max_lots: float = 1.0,
     ) -> None:
+        self.risk_pct = risk_per_trade_pct
+        self.money_per_point = money_per_point_1lot
+        self.volume_max = volume_max
+        self.max_lots = max_lots
+        self.last_skip = ""
+        self._server_sl_sent: float | None = None
+        self._server_sl_ns = 0
+        # télémétrie de l'aller-retour en cours
+        self._t_spread = 0.0
+        self._t_slip = 0.0
+        self._t_latency = 0.0
         self.stops_level = stops_level_points * point
         self.freeze_level = freeze_level_points * point
         self.server_sl_mult = server_sl_mult
@@ -105,6 +121,7 @@ class OrderManager:
         self.fill_count = 0
         self.order_count = 0
         self.tick_to_order = LatencyTracker("tick->ordre")
+        self.ack_latency = LatencyTracker("envoi->ACK")
         gateway.set_event_sink(self.on_event)
 
     # ------------------------------------------------------------------ #
@@ -155,6 +172,22 @@ class OrderManager:
         if self.has_inflight:
             return 0
         target = self.round_qty(decision.target_position)
+        if (self.position == 0.0 and target != 0.0 and self.risk_pct > 0
+                and decision.stop_points and not self.orders):
+            # Ouverture : taille calculée pour risquer risk_pct % du capital sur ce stop
+            cap = self.max_lots
+            notional_lot = (top.bid + top.ask) * 0.5 * self.contract_size
+            if self.risk.limits.max_notional > 0 and notional_lot > 0:
+                # la taille respecte aussi le plafond d'exposition (levier max)
+                cap = min(cap, self.risk.limits.max_notional / notional_lot)
+            lots = lots_for_risk(self.risk.equity, self.risk_pct, decision.stop_points,
+                                 self.money_per_point, self.volume_min, self.volume_step,
+                                 self.volume_max, cap)
+            if lots <= 0.0:
+                self.last_skip = (f"lot minimum trop risqué pour {self.risk_pct:g} % "
+                                  f"(stop {decision.stop_points:.0f} pts)")
+                return 0
+            target = lots if target > 0 else -lots
         # Retournement : on ferme d'abord, on ouvre au tick suivant (jamais d'ordre qui
         # ferme ET ouvre — indispensable sur les comptes hedging MT5).
         if self.position != 0.0 and target != 0.0 and (target > 0) != (self.position > 0):
@@ -216,6 +249,26 @@ class OrderManager:
                 return await self._replace(same, price, t0_ns)
         return 0
 
+    async def update_protective_sl(self, stop: float, top: BookTop) -> bool:
+        """Reporte côté serveur un stop resserré (break-even, trailing). Ne fait que resserrer."""
+        modify = getattr(self.gateway, "modify_sl", None)
+        if modify is None or self.position == 0.0 or self.server_sl_mult <= 0:
+            return False
+        d = 1.0 if self.position > 0 else -1.0
+        buf = max(self.stops_level + 2 * self.point, 5 * self.point)
+        sl = stop - d * buf                         # un peu au-delà du stop interne du bot
+        limit = (top.bid - self.stops_level - self.point) if d > 0 else (top.ask + self.stops_level + self.point)
+        sl = min(sl, limit) if d > 0 else max(sl, limit)
+        sl = self.round_price(sl)
+        if self._server_sl_sent is not None and (sl - self._server_sl_sent) * d <= self.point / 2:
+            return False
+        now = self._clock()
+        if now - self._server_sl_ns < 1_000_000_000:          # au plus une modification / s
+            return False
+        self._server_sl_sent, self._server_sl_ns = sl, now
+        await modify(sl, d > 0)
+        return True
+
     def _frozen(self, order: Order) -> bool:
         """SYMBOL_TRADE_FREEZE_LEVEL : ordre trop proche du marché pour être modifié/annulé."""
         top = self.last_top
@@ -259,8 +312,9 @@ class OrderManager:
                    t0_ns: int, data_age_ms: float, reducing: bool = False,
                    top: BookTop | None = None, spread_pts: float = 0.0) -> int:
         signed = qty * int(side)
+        mark = (top.bid + top.ask) * 0.5 if top is not None else 0.0
         verdict = self.risk.check_order(signed, self.position, self.working_signed, data_age_ms,
-                                        spread_pts)
+                                        spread_pts, mark * self.contract_size)
         if not verdict.allowed:
             log.debug("ordre refusé par le risque : %s %s", verdict.reason.value, verdict.detail)
             return 0
@@ -269,9 +323,15 @@ class OrderManager:
             log.error("client_order_id dupliqué %s", cid)
             return 0
         self._known_ids.add(cid)
+        now = self._clock()
+        req = price if price is not None else (
+            (top.ask if side is Side.BUY else top.bid) if top is not None else 0.0)
         order = Order(cid, self.symbol, side, qty, otype, price, tick_recv_ns=t0_ns,
-                      created_ns=self._clock(), updated_ns=self._clock(), reduce_only=reducing,
-                      sl=None if reducing else self._server_sl(side, top))
+                      created_ns=now, updated_ns=now, reduce_only=reducing,
+                      sl=None if reducing else self._server_sl(side, top),
+                      req_price=req, req_spread_pts=spread_pts, sent_ns=now)
+        if not reducing and self.position == 0.0:
+            self._t_spread, self._t_slip, self._t_latency = spread_pts, 0.0, 0.0
         self.orders[cid] = order
         self.order_count += 1
         self.tick_to_order.record(time.perf_counter_ns() - t0_ns)
@@ -326,6 +386,8 @@ class OrderManager:
 
         if k is EventKind.ACK:
             self.risk.record_execution_ok()
+            if order.sent_ns and order.status is OrderStatus.PENDING_NEW:
+                self.ack_latency.record(max(self._clock() - order.sent_ns, 0))
             if order.status is OrderStatus.PENDING_NEW:
                 order.status = OrderStatus.WORKING
         elif k is EventKind.FILL:
@@ -340,6 +402,12 @@ class OrderManager:
             self.fees += ev.fee
             self.fill_count += 1
             pos_before, avg_before = self.position, self.avg_price
+            if order.req_price:
+                # slippage en points, positif = défavorable ; latence d'exécution en ms
+                slip = (ev.fill_price - order.req_price) * int(order.side) / self.point
+                self._t_slip += slip * qty / max(order.qty, 1e-12)
+                if not order.reduce_only and pos_before == 0.0 and order.sent_ns:
+                    self._t_latency = (self._clock() - order.sent_ns) / 1e6
             self._apply_fill(order.side, qty, ev.fill_price)
             self._track_trade(pos_before, avg_before, ev.fill_price, fees_before)
             if order.remaining <= _EPS:
@@ -405,7 +473,9 @@ class OrderManager:
         if self.journal is not None:
             self.journal.record("BUY" if pos_before > 0 else "SELL", abs(pos_before), avg_before,
                                 price, (now - self._open_ns) / 1e9, gross, fees, self.exit_reason,
-                                self._entry_strategy)
+                                self._entry_strategy, self._t_spread, self._t_slip, self._t_latency)
+        self.risk.record_trade(gross - fees)
+        self._server_sl_sent = None
         if pos != 0.0:          # retournement : un nouvel aller-retour commence
             self._open_ns, self._open_realized, self._open_fees = now, self.realized_pnl, self.fees
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from zeus_hft.core.orderbook import BookTop
 from zeus_hft.core.types import Decision, Urgency
+from zeus_hft.strategies.exits import ExitManager
 from zeus_hft.strategies.features import MarketFeatures
 
 
@@ -28,12 +29,16 @@ class MomentumBreakout:
         self.point = point
         self.qty = s.order_qty
         self._max_hold_ns = int(s.mom_max_hold_s * 1e9)
+        self.exit = ExitManager(s, point, self.name)
+        self.vol_step = s.volume_step
+        self.vol_min = s.volume_min
         self.reset()
 
     def reset(self) -> None:
         self._entry_ns = 0
         self._entry_atr = 0.0
         self.last_reason = ""
+        self.exit.reset()
 
     def _d(self, target: float, urg: Urgency, reason: str, price: float | None = None,
            stop: float | None = None) -> Decision:
@@ -46,20 +51,22 @@ class MomentumBreakout:
         if position != 0.0:
             if self._entry_ns == 0:
                 self._entry_ns, self._entry_atr = now_ns, max(f.atr, self.point)
-            d = 1.0 if position > 0 else -1.0
             atr = self._entry_atr
-            pnl = (f.mid - avg_price) * d
-            if pnl <= -s.mom_sl_atr * atr:
-                return self._d(0.0, Urgency.AGGRESSIVE, "SL momentum")
-            if now_ns - self._entry_ns >= self._max_hold_ns:
+            if not self.exit.active:
+                self.exit.start(avg_price, position, s.mom_sl_atr * atr, s.mom_tp_atr * atr)
+            dec = self.exit.update(f.mid, f.atr, top, position, self.vol_step, self.vol_min)
+            if dec is not None:
+                self.last_reason = dec.reason
+                return dec
+            d = 1.0 if position > 0 else -1.0
+            hold = self._max_hold_ns * (s.runner_hold_mult if self.exit.partial else 1.0)
+            if now_ns - self._entry_ns >= hold:
                 return self._d(0.0, Urgency.AGGRESSIVE, "durée max momentum")
-            if f.velocity * d < -s.velocity_entry_atr * atr:
+            if not self.exit.partial and f.velocity * d < -s.velocity_entry_atr * atr:
                 return self._d(0.0, Urgency.AGGRESSIVE, "momentum inversé")
-            if pnl >= s.mom_tp_atr * atr:
-                return self._d(0.0, Urgency.PASSIVE, "TP momentum",
-                               price=top.ask if d > 0 else top.bid)
             return None
         self._entry_ns = 0
+        self.exit.reset()
 
         if not f.regime.momentum_allowed or f.range_hi is None or f.range_lo is None:
             return None
@@ -71,8 +78,16 @@ class MomentumBreakout:
         buf = s.breakout_buffer_atr * atr
         v_min = s.velocity_entry_atr * atr
         stop = s.mom_sl_atr * atr / self.point
+        direction = 0
         if f.mid > f.range_hi + buf and f.velocity >= v_min:
-            return self._d(self.qty, Urgency.AGGRESSIVE, "cassure haussière", stop=stop)
-        if f.mid < f.range_lo - buf and f.velocity <= -v_min:
-            return self._d(-self.qty, Urgency.AGGRESSIVE, "cassure baissière", stop=stop)
-        return None
+            direction = 1
+        elif f.mid < f.range_lo - buf and f.velocity <= -v_min:
+            direction = -1
+        if direction == 0:
+            return None
+        ok, why = f.trend.allows_momentum(direction)
+        if not ok:
+            self.last_reason = f"cassure ignorée : {why}"
+            return None
+        label = "cassure haussière" if direction > 0 else "cassure baissière"
+        return self._d(direction * self.qty, Urgency.AGGRESSIVE, label, stop=stop)

@@ -10,6 +10,7 @@ DRY_RUN et le backtest (fidélité du backtest). La boucle temps réel ajoute :
 from __future__ import annotations
 
 import asyncio
+import os
 import logging
 import time
 from dataclasses import dataclass, field
@@ -55,7 +56,12 @@ class Engine:
         reconcile: Callable[[list[Any]], Any] | None = None,
         starting_equity: float | None = None,
         position_snapshot: Callable[[], Any] | None = None,
+        alerter: Any = None,
+        recorder: Any = None,
     ) -> None:
+        self.alerter = alerter
+        self.recorder = recorder
+        self.metrics_server: Any = None
         self._position_snapshot = position_snapshot
         self._last_tick_perf = 0
         self.s = s
@@ -95,6 +101,8 @@ class Engine:
         self.stats.ticks += 1
         self._last_tick = tick
         self._last_tick_perf = time.perf_counter_ns()
+        if self.recorder is not None:
+            self.recorder.put(tick)
 
         if self.sim is not None:                  # exécutions simulées avant la décision
             self.sim.on_market(tick.bid, tick.ask)
@@ -131,6 +139,11 @@ class Engine:
             return
         age_ms = (now - self.book.last_update_ns) / 1e6
         self.stats.actions += await self.om.execute(decision, top, t0, age_ms)
+        pop = getattr(self.strategy, "pop_protective_sl", None)
+        if pop is not None:
+            sl = pop()
+            if sl is not None:
+                await self.om.update_protective_sl(sl, top)
 
     async def _handle_kill(self, t0: int) -> None:
         if not self._kill_handled:
@@ -167,7 +180,11 @@ class Engine:
             asyncio.create_task(self._model_save_loop(), name="model-save"),
             asyncio.create_task(self._watchdog_loop(), name="watchdog"),
             asyncio.create_task(self._position_sync_loop(), name="position-sync"),
+            asyncio.create_task(self._news_loop(), name="news"),
+            asyncio.create_task(self._state_loop(), name="state"),
+            asyncio.create_task(self._hot_config_loop(), name="hot-config"),
         ]
+        self._alert("info", "start", f"démarré ({self.account_label or self.s.mode.value})", force=True)
         tasks[0].add_done_callback(lambda t: None if t.cancelled() else self._on_feed_done(t))
         log.info("moteur démarré (%s, %s)", self.s.mode.value, self.s.symbol)
         try:
@@ -214,8 +231,16 @@ class Engine:
         except Exception:
             log.exception("erreur pendant l'arrêt")
         await self._save_model()
+        await self._save_state()
+        self._alert("info", "stop", "arrêté — " + self._day_line(), force=True)
         if self.om.journal is not None:
             self.om.journal.close()
+        if self.recorder is not None:
+            await asyncio.to_thread(self.recorder.close)
+        if self.metrics_server is not None:
+            await asyncio.to_thread(self.metrics_server.close)
+        if self.alerter is not None:
+            await asyncio.to_thread(self.alerter.close)
         self._stop.set()  # type: ignore[union-attr]
         for t in tasks:
             t.cancel()
@@ -231,9 +256,23 @@ class Engine:
                 ping = await self._heartbeat()
                 if ping is None:
                     log.warning("terminal MT5 déconnecté")
+                    self._alert("warn", "mt5-off", "terminal MT5 déconnecté du serveur du broker")
                     self.risk.record_latency(float("inf"))
                 else:
+                    if self.risk.latency_blocked and ping <= self.s.max_latency_ms:
+                        self._alert("ok", "lat-ok", f"latence revenue à {ping:.0f} ms")
                     self.risk.record_latency(ping)
+                    if self.s.is_live:
+                        reason = getattr(self.feed, "algo_reason", "")
+                        if reason and "algo" not in self.risk.halts:
+                            self.risk.halt("algo", reason)
+                            self._alert("crit", "algo", f"ordres bloqués : {reason}", force=True)
+                        elif not reason and "algo" in self.risk.halts:
+                            self.risk.resume("algo")
+                            self._alert("ok", "algo-ok", "trading algorithmique de nouveau autorisé")
+                    if ping > self.s.max_latency_ms:
+                        self._alert("warn", "lat", f"latence {ping:.0f} ms > {self.s.max_latency_ms:.0f} ms "
+                                                   "(entrées bloquées)")
             except Exception:
                 log.exception("heartbeat")
             await asyncio.sleep(self.s.heartbeat_interval)
@@ -267,6 +306,120 @@ class Engine:
             await asyncio.sleep(60.0)
             await self._save_model()
 
+    # ------------------------------------------------------------------ #
+    # Exploitation : alertes, sauvegarde d'état, configuration à chaud
+    # ------------------------------------------------------------------ #
+    def _alert(self, level: str, key: str, text: str, force: bool = False) -> None:
+        if self.alerter is not None:
+            self.alerter.alert(level, key, text, force)
+
+    def _day_line(self) -> str:
+        j = self.om.journal.stats() if self.om.journal is not None else None
+        rk = self.risk
+        base = f"PnL du jour {rk.daily_pnl:+,.2f} · equity {rk.equity:,.2f}"
+        return base + (f" · {j.trades} trades, {j.win_rate:.0%} gagnants — {j.verdict}" if j else "")
+
+    async def _save_state(self) -> None:
+        path = self.s.resolved_state_file()
+        state = {"risk": self.risk.to_state(), "saved_at": time.time(),
+                 "position": self.om.position, "avg_price": self.om.avg_price}
+
+        def write() -> None:
+            import json
+            from pathlib import Path
+            p = Path(path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            tmp = p.with_suffix(".tmp")
+            tmp.write_text(json.dumps(state), encoding="utf-8")
+            os.replace(tmp, p)
+        try:
+            await asyncio.to_thread(write)
+        except OSError:
+            log.exception("sauvegarde de l'état")
+
+    async def _state_loop(self) -> None:
+        """Instantané de l'état toutes les 5 s : un crash ne fait pas oublier l'arrêt du jour."""
+        day = self.risk._day
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            await asyncio.sleep(5.0)
+            await self._save_state()
+            if self.risk._day != day:                       # nouvelle journée UTC : bilan
+                self._alert("info", "daily", "bilan de la journée — " + self._day_line(), force=True)
+                day = self.risk._day
+
+    def apply_hot(self, changes: dict[str, Any], enabled: bool | None) -> None:
+        for k, v in changes.items():
+            for target in (self.s, getattr(self.om.gateway, "s", None)):
+                if target is not None and hasattr(target, k):
+                    setattr(target, k, v)
+        lim, s = self.risk.limits, self.s
+        lim.max_spread_points = s.max_spread_points
+        lim.max_daily_drawdown = s.max_daily_drawdown
+        lim.max_daily_loss_pct = s.max_daily_loss_pct
+        lim.max_consecutive_losses = s.max_consecutive_losses
+        lim.max_orders_per_second = s.max_orders_per_second
+        self.om.risk_pct = s.risk_per_trade_pct
+        self.om.max_lots = s.max_lots
+        if s.risk_per_trade_pct > 0:
+            lim.max_net_inventory = s.max_lots
+        if enabled is False and "manuel" not in self.risk.halts:
+            self.risk.halt("manuel", "pause manuelle (configuration à chaud)")
+        elif enabled is True and "manuel" in self.risk.halts:
+            self.risk.resume("manuel")
+            self._alert("ok", "manuel", "reprise manuelle du trading", force=True)
+        if changes:
+            log.warning("configuration à chaud appliquée : %s", changes)
+            self._alert("info", "hot", f"réglages modifiés à chaud : {changes}", force=True)
+
+    async def _hot_config_loop(self) -> None:
+        from zeus_hft.ops.hotconfig import read_hot_file, validate_changes
+
+        path = self.s.hot_config_file
+        last = -1.0
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            try:
+                mtime = await asyncio.to_thread(os.path.getmtime, path)
+                if mtime != last:
+                    last = mtime
+                    raw = await asyncio.to_thread(read_hot_file, path)
+                    changes, enabled, errors = validate_changes(self.s, raw)
+                    for e in errors:
+                        log.error("configuration à chaud : %s", e)
+                    self.apply_hot(changes, enabled)
+            except FileNotFoundError:
+                pass
+            except (OSError, ValueError) as exc:
+                log.error("configuration à chaud illisible : %s", exc)
+            await asyncio.sleep(5.0)
+
+    async def _news_loop(self) -> None:
+        """Recharge chaque minute le calendrier exporté par ZeusNewsExporter.mq5 (si présent)."""
+        update = getattr(self.strategy, "update_news", None)
+        path = self.s.resolved_news_file()
+        if update is None or not path:
+            return
+        from zeus_hft.strategies.news_file import load_news_csv
+
+        last_mtime = -1.0
+        warned = False
+        while not self._stop.is_set():  # type: ignore[union-attr]
+            try:
+                mtime = await asyncio.to_thread(os.path.getmtime, path)
+                if mtime != last_mtime:
+                    events = await asyncio.to_thread(load_news_csv, path)
+                    update(events)
+                    last_mtime = mtime
+                    log.info("calendrier MT5 : %d annonces à fort impact chargées", len(events))
+                    if (time.time() - mtime) > 3 * 3600:
+                        log.warning("calendrier MT5 ancien (%.0f h) : ZeusNewsExporter tourne-t-il ?",
+                                    (time.time() - mtime) / 3600)
+            except OSError:
+                if not warned:
+                    log.warning("calendrier MT5 introuvable (%s) : installe ZeusNewsExporter.mq5 "
+                                "ou saisis les heures de news à la main", path)
+                    warned = True
+            await asyncio.sleep(60.0)
+
     async def _watchdog_loop(self) -> None:
         """Flux figé (plus aucun tick) -> pause des nouvelles entrées, reprise automatique."""
         limit = self.s.max_feed_silence_s
@@ -279,10 +432,17 @@ class Engine:
                 if "flux" not in self.risk.halts:
                     log.warning("aucun tick depuis %.0f s : nouvelles entrées suspendues "
                                 "(marché fermé ou flux figé)", silence)
-                self.risk.halt("flux", f"flux figé depuis {silence:.0f} s")
+                    self.risk.halt("flux", f"flux figé depuis {silence:.0f} s")
+                    # heartbeat de données perdu : on annule tout ordre en attente
+                    # (les positions restent protégées par leur SL serveur)
+                    if self.om.orders:
+                        await self.om.cancel_all()
+                else:
+                    self.risk.halts["flux"] = f"flux figé depuis {silence:.0f} s"
             elif "flux" in self.risk.halts:
                 log.info("flux rétabli : reprise")
                 self.risk.resume("flux")
+                self._alert("ok", "flux-ok", "flux de prix rétabli")
 
     async def _position_sync_loop(self) -> None:
         """LIVE : compare la position MT5 à celle du bot (SL serveur touché, clôture manuelle)."""
@@ -315,6 +475,7 @@ class Engine:
         top = self.book.top()
         d = self.decision_latency.stats()
         o = self.om.tick_to_order.stats()
+        a = self.om.ack_latency.stats()
         return {
             "running": self.running,
             "bid": top.bid if top else None,
@@ -332,6 +493,9 @@ class Engine:
             "decision_p50_us": d.p50_us if d else None,
             "decision_p99_us": d.p99_us if d else None,
             "tick_to_order_p50_us": o.p50_us if o else None,
+            "tick_to_order_p99_us": o.p99_us if o else None,
+            "ack_p50_us": a.p50_us if a else None,
+            "ack_p99_us": a.p99_us if a else None,
             "risk": self.risk.status(),
             "strategy": self.strategy.state(),
             "account": self.account_label,

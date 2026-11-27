@@ -25,7 +25,8 @@ MON_0800_UTC = 1_767_571_200_000 + 8 * 3_600_000          # lundi 5 janv. 2026 0
 
 
 def S(**kw: object) -> Settings:
-    base = {"server_utc_offset_hours": 0.0, "atr_period": 3, "atr_baseline_bars": 10}
+    base = {"server_utc_offset_hours": 0.0, "atr_period": 3, "atr_baseline_bars": 10,
+            "trend_filter": False, "blackout_sessions_utc": "", "spread_avg_mult": 100.0}
     base.update(kw)
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
 

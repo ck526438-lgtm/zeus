@@ -20,6 +20,8 @@ from tkinter import messagebox, ttk
 from typing import Any
 
 from zeus_hft import __version__
+from pydantic import SecretStr
+
 from zeus_hft.config.settings import Mode, Settings
 from zeus_hft.core.telemetry import setup_logging
 
@@ -145,19 +147,24 @@ class App(tk.Tk):
         self.lot = tk.StringVar(value=saved.get("lot", "0.01"))
         self.maxdd = tk.StringVar(value=saved.get("maxdd", "300"))
         self.maxspread = tk.StringVar(value=saved.get("maxspread", f"{base.max_spread_points:g}"))
+        self.riskpct = tk.StringVar(value=saved.get("riskpct", f"{base.risk_per_trade_pct:g}"))
+        self.trend = tk.BooleanVar(value=saved.get("trend", True))
         self.strategy = tk.StringVar(value=saved.get("strategy", "Auto (selon le marché)"))
         self.news = tk.StringVar(value=saved.get("news", base.news_times_utc))
         self.synthetic = tk.BooleanVar(value=saved.get("synthetic", False))
         self.use_model = tk.BooleanVar(value=saved.get("use_model", True))
         self.confirm_live = tk.BooleanVar(value=False)          # jamais mémorisé, par sécurité
         self.autostart = tk.BooleanVar(value=saved.get("autostart", False))
+        self.tg_token = tk.StringVar(value=saved.get("tg_token", ""))
+        self.tg_chat = tk.StringVar(value=saved.get("tg_chat", ""))
         for label, w in (
             ("Mode", ttk.Combobox(cfg, textvariable=self.mode, values=["DRY_RUN", "LIVE"],
                                   width=9, state="readonly")),
             ("Stratégie", ttk.Combobox(cfg, textvariable=self.strategy, values=list(STRATEGIES),
                                        width=22, state="readonly")),
             ("Symbole", ttk.Entry(cfg, textvariable=self.symbol, width=10)),
-            ("Lot", ttk.Entry(cfg, textvariable=self.lot, width=6)),
+            ("Risque/trade %", ttk.Entry(cfg, textvariable=self.riskpct, width=5)),
+            ("Lot si 0 %", ttk.Entry(cfg, textvariable=self.lot, width=5)),
             ("Perte max/jour", ttk.Entry(cfg, textvariable=self.maxdd, width=7)),
             ("Spread max (pts)", ttk.Entry(cfg, textvariable=self.maxspread, width=5)),
         ):
@@ -168,6 +175,7 @@ class App(tk.Tk):
         cfg2.pack(fill="x", padx=16, pady=4)
         ttk.Label(cfg2, text="News (UTC, ex. 13:30, 2026-12-04 13:30)").pack(side="left", padx=(0, 4))
         ttk.Entry(cfg2, textvariable=self.news, width=34).pack(side="left", padx=(0, 12))
+        ttk.Checkbutton(cfg2, text="Filtre tendance H1/M15", variable=self.trend).pack(side="left", padx=4)
         ttk.Checkbutton(cfg2, text="IA adaptative", variable=self.use_model).pack(side="left", padx=4)
         ttk.Checkbutton(cfg2, text="Simulation sans MT5", variable=self.synthetic).pack(side="left", padx=4)
         ttk.Checkbutton(cfg2, text="Autoriser compte réel", variable=self.confirm_live).pack(side="left", padx=4)
@@ -177,7 +185,11 @@ class App(tk.Tk):
         ttk.Checkbutton(cfg3, text="Démarrage automatique (à l'ouverture + relance si MT5 se coupe)",
                         variable=self.autostart, command=self._save_config).pack(side="left", padx=(0, 12))
         self.b_boot = ttk.Button(cfg3, text="", command=self._toggle_windows_startup)
-        self.b_boot.pack(side="left")
+        self.b_boot.pack(side="left", padx=(0, 16))
+        ttk.Label(cfg3, text="Alertes Telegram : jeton").pack(side="left", padx=(0, 4))
+        ttk.Entry(cfg3, textvariable=self.tg_token, width=18, show="•").pack(side="left", padx=(0, 6))
+        ttk.Label(cfg3, text="chat id").pack(side="left", padx=(0, 4))
+        ttk.Entry(cfg3, textvariable=self.tg_chat, width=12).pack(side="left")
         self._update_boot_button()
 
         btns = ttk.Frame(self)
@@ -194,7 +206,8 @@ class App(tk.Tk):
         grid.pack(fill="x", padx=16, pady=6)
         self.vals: dict[str, ttk.Label] = {}
         cards = [("bid", "Bid"), ("ask", "Ask"), ("position", "Position (lots)"), ("pnl", "PnL net"),
-                 ("equity", "Equity"), ("fills", "Exécutions"), ("regime", "Régime de marché"),
+                 ("equity", "Equity"), ("trend", "Tendance H1 / M15 · ADX"),
+                 ("regime", "Régime de marché"),
                  ("strat", "Stratégie en position"),
                  ("atr", "ATR M1 (pts) / vol×"), ("spread", "Spread (pts)"),
                  ("ia", "IA : précision / poids"), ("risk", "Risque"),
@@ -238,9 +251,11 @@ class App(tk.Tk):
     def _save_config(self) -> None:
         data = {"mode": self.mode.get(), "symbol": self.symbol.get(), "lot": self.lot.get(),
                 "maxdd": self.maxdd.get(), "maxspread": self.maxspread.get(),
+                "riskpct": self.riskpct.get(), "trend": self.trend.get(),
                 "strategy": self.strategy.get(), "news": self.news.get(),
                 "synthetic": self.synthetic.get(), "use_model": self.use_model.get(),
-                "autostart": self.autostart.get()}
+                "autostart": self.autostart.get(),
+                "tg_token": self.tg_token.get().strip(), "tg_chat": self.tg_chat.get().strip()}
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             CONFIG.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -277,8 +292,12 @@ class App(tk.Tk):
             "max_daily_drawdown": float(self.maxdd.get().replace(",", ".")),
             "max_spread_points": float(self.maxspread.get().replace(",", ".")),
             "strategy": STRATEGIES.get(self.strategy.get(), "auto"),
+            "risk_per_trade_pct": float(self.riskpct.get().replace(",", ".")),
+            "trend_filter": self.trend.get(),
             "news_times_utc": self.news.get().strip(),
             "confirm_live": self.confirm_live.get(),
+            **({"telegram_token": SecretStr(self.tg_token.get().strip()),
+                "telegram_chat": self.tg_chat.get().strip()} if self.tg_token.get().strip() else {}),
         })
 
     def _start(self, auto: bool = False) -> None:
@@ -354,7 +373,12 @@ class App(tk.Tk):
             pnl = snap["pnl"]
             self.vals["pnl"].config(text=f"{pnl:+,.2f}", foreground=GREEN if pnl >= 0 else RED)
             self.vals["equity"].config(text=fmt(rk["equity"]))
-            self.vals["fills"].config(text=f"{snap['fills']} / {snap['orders']}")
+            arrow = {1: "↑", -1: "↓", 0: "—"}
+            if st.get("trend_ready"):
+                self.vals["trend"].config(text=f"{arrow.get(st.get('h1_dir', 0))} / "
+                                               f"{arrow.get(st.get('m15_dir', 0))} · {st.get('adx_m15', 0):.0f}")
+            else:
+                self.vals["trend"].config(text="calcul…")
             self.vals["lat"].config(text=f"{fmt(snap['decision_p50_us'], 0)} / {fmt(snap['decision_p99_us'], 0)} µs")
             self.vals["ia"].config(text=f"{st.get('model_acc', 0):.1%} / {st.get('model_conf', 0):.2f}")
             reg = st.get("regime", "—")
@@ -364,7 +388,10 @@ class App(tk.Tk):
             self.vals["atr"].config(text=f"{st.get('atr_pts', 0):.0f} / {st.get('vol_ratio', 0):.2f}")
             self.vals["spread"].config(text=fmt(st.get("spread_pts"), 1))
             halts = rk.get("halts") or []
-            self.reason.config(text=("⏸ " + "; ".join(halts)) if halts else f"Décision : {st.get('reason', '')}")
+            news = f"   ·   prochaine news : {st['next_news']}" if st.get("next_news") else ""
+            self.reason.config(text=(("⏸ " + "; ".join(halts)) if halts else
+                                     f"Décision : {st.get('reason', '')}") +
+                               f"   ·   ordres {snap['fills']}/{snap['orders']}" + news)
             self.by_strat.config(text=snap.get("by_strategy", ""))
             j = snap.get("journal")
             if j is not None:

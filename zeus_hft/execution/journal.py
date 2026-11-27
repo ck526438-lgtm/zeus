@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import queue
 import threading
 from collections import deque
@@ -18,7 +19,33 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 FIELDS = ["close_time_utc", "mode", "symbol", "side", "qty", "entry_price", "exit_price",
-          "duration_s", "gross_pnl", "fees", "net_pnl", "reason", "strategy"]
+          "duration_s", "gross_pnl", "fees", "net_pnl", "reason", "strategy",
+          "entry_spread_pts", "slippage_pts", "exec_latency_ms", "chain_hash"]
+GENESIS = "zeus-hft"
+
+
+def chain(prev: str, fields: list[object]) -> str:
+    """Empreinte de la ligne, liée à la précédente : modifier/supprimer une ligne casse la chaîne."""
+    payload = prev + "|" + ",".join(str(x) for x in fields)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def verify_journal(path: str | Path) -> tuple[bool, int, int | None]:
+    """(intègre ?, nombre de lignes, n° de la 1re ligne altérée — 2 = 1re ligne de données)."""
+    prev = GENESIS
+    n = 0
+    with open(path, newline="", encoding="utf-8") as f:
+        r = csv.reader(f)
+        header = next(r, None)
+        if header != FIELDS:
+            return False, 0, 1
+        for i, row in enumerate(r, start=2):
+            n += 1
+            h = chain(prev, row[:-1])
+            if row[-1] != h:
+                return False, n, i
+            prev = h
+    return True, n, None
 
 
 @dataclass(slots=True)
@@ -36,12 +63,21 @@ class TradeRecord:
     net_pnl: float
     reason: str = ""
     strategy: str = ""
+    entry_spread_pts: float = 0.0
+    slippage_pts: float = 0.0
+    exec_latency_ms: float = 0.0
+
+    chain_hash: str = ""
 
     def row(self) -> list[object]:
         return [self.close_time_utc, self.mode, self.symbol, self.side, round(self.qty, 4),
                 round(self.entry_price, 5), round(self.exit_price, 5), round(self.duration_s, 2),
                 round(self.gross_pnl, 4), round(self.fees, 4), round(self.net_pnl, 4), self.reason,
-                self.strategy]
+                self.strategy, round(self.entry_spread_pts, 1), round(self.slippage_pts, 2),
+                round(self.exec_latency_ms, 1)]
+
+    def full_row(self) -> list[object]:
+        return self.row() + [self.chain_hash]
 
 
 @dataclass(slots=True)
@@ -80,6 +116,8 @@ class TradeJournal:
         self.losses = 0.0
         self.recent: deque[float] = deque(maxlen=window)
         self.by_strategy: dict[str, list[float]] = {}     # stratégie -> [trades, net, gains, pertes]
+        self.records: list[TradeRecord] = []                # trades de cette session (Monte Carlo)
+        self._last_hash = GENESIS
         self._q: queue.SimpleQueue[TradeRecord | None] = queue.SimpleQueue()
         self._thread: threading.Thread | None = None
         if self.path is not None:
@@ -97,12 +135,18 @@ class TradeJournal:
                 reader = csv.DictReader(f)
                 header = reader.fieldnames or []
                 rows = list(reader)
-            if header != FIELDS:            # ancien format (v2.1) : migration sans perte
+            if header != FIELDS:            # ancien format : migration sans perte + chaîne
+                prev = GENESIS
                 with open(self.path, "w", newline="", encoding="utf-8") as f:
-                    w = csv.DictWriter(f, FIELDS, extrasaction="ignore")
-                    w.writeheader()
+                    w = csv.writer(f)
+                    w.writerow(FIELDS)
                     for r in rows:
-                        w.writerow({k: r.get(k, "") for k in FIELDS})
+                        vals = [r.get(k, "") or "" for k in FIELDS[:-1]]
+                        prev = chain(prev, vals)
+                        w.writerow(vals + [prev])
+                self._last_hash = prev
+            elif rows:
+                self._last_hash = rows[-1].get("chain_hash") or GENESIS
             for row in rows:
                 # on ne mélange pas démo réelle, paper trading et autres symboles
                 if row.get("mode") == self.mode and row.get("symbol") == self.symbol:
@@ -123,7 +167,7 @@ class TradeJournal:
                     w = csv.writer(f)
                     if new:
                         w.writerow(FIELDS)
-                    w.writerow(rec.row())
+                    w.writerow(rec.full_row())
             except OSError:
                 pass  # disque plein / fichier ouvert dans Excel : on ne bloque jamais le trading
 
@@ -146,11 +190,16 @@ class TradeJournal:
 
     # ------------------------------------------------------------------ #
     def record(self, side: str, qty: float, entry: float, exit_: float, duration_s: float,
-               gross: float, fees: float, reason: str = "", strategy: str = "") -> TradeRecord:
+               gross: float, fees: float, reason: str = "", strategy: str = "",
+               entry_spread_pts: float = 0.0, slippage_pts: float = 0.0,
+               exec_latency_ms: float = 0.0) -> TradeRecord:
         rec = TradeRecord(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), self.mode,
                           self.symbol, side, qty, entry, exit_, duration_s, gross, fees,
-                          gross - fees, reason, strategy)
+                          gross - fees, reason, strategy, entry_spread_pts, slippage_pts,
+                          exec_latency_ms)
         self._account(rec.net_pnl, strategy)
+        rec.chain_hash = self._last_hash = chain(self._last_hash, rec.row())
+        self.records.append(rec)
         if self._thread is not None:
             self._q.put(rec)
         return rec

@@ -37,19 +37,20 @@ jobs:
 
       - name: Build ZeusHFT.exe (console) et ZeusHFT-App.exe (fenêtre)
         run: |
-          pyinstaller --noconfirm --onefile --console  --name ZeusHFT     --collect-submodules zeus_hft --hidden-import MetaTrader5 zeus_hft_cli.py
-          pyinstaller --noconfirm --onefile --windowed --name ZeusHFT-App --collect-submodules zeus_hft --hidden-import MetaTrader5 zeus_hft_gui.py
+          pyinstaller --noconfirm --onefile --console  --name ZeusHFT     --collect-submodules zeus_hft --collect-submodules websockets --hidden-import MetaTrader5 zeus_hft_cli.py
+          pyinstaller --noconfirm --onefile --windowed --name ZeusHFT-App --collect-submodules zeus_hft --collect-submodules websockets --hidden-import MetaTrader5 zeus_hft_gui.py
 
       - name: Test des exécutables
         run: |
           dist\ZeusHFT.exe --version
           dist\ZeusHFT.exe backtest --synthetic 5000
+          dist\ZeusHFT.exe mm-backtest --synthetic 600
 
       - name: Paquet
         shell: pwsh
         run: |
           New-Item -ItemType Directory -Force release | Out-Null
-          Copy-Item dist\ZeusHFT.exe, dist\ZeusHFT-App.exe, .env.example, zeus_hft\README.md release\
+          Copy-Item dist\ZeusHFT.exe, dist\ZeusHFT-App.exe, .env.example, zeus_hft\README.md, mql5\ZeusNewsExporter.mq5 release\
           Compress-Archive -Path release\* -DestinationPath ZeusHFT-windows.zip -Force
 
       - uses: actions/upload-artifact@v4
